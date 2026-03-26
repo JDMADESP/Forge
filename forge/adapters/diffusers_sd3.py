@@ -75,8 +75,17 @@ class DiffusersSD3Adapter(ModelAdapter):
         self.train_model = model
         self.primary_train_model = model
         self.runtime_modules["dit"] = model
+        device = next(model.parameters()).device
+        for module_name in ("vae", "text_encoder", "text_encoder_2", "text_encoder_3"):
+            module = self.runtime_modules.get(module_name)
+            if module is not None:
+                module.to(device)
         if self.pipeline is not None:
             self.pipeline.transformer = model
+            self.pipeline.vae = self.runtime_modules["vae"]
+            self.pipeline.text_encoder = self.runtime_modules["text_encoder"]
+            self.pipeline.text_encoder_2 = self.runtime_modules["text_encoder_2"]
+            self.pipeline.text_encoder_3 = self.runtime_modules["text_encoder_3"]
 
     def forward_loss(self, batch_state: BatchState) -> dict[str, Any]:
         if self.train_model is None and self.primary_train_model is None:
@@ -85,8 +94,9 @@ class DiffusersSD3Adapter(ModelAdapter):
         prompts = batch_state.raw_batch["prompts"]
         model = self.train_model if self.train_model is not None else self.primary_train_model
 
-        device = pixel_values.device
-        dtype = next(model.parameters()).dtype
+        first_param = next(model.parameters())
+        device = first_param.device
+        dtype = first_param.dtype
         scheduler = self.runtime_modules["noise_scheduler"]
         latents = self._encode_latents(pixel_values, device)
         prompt_embeds, pooled_prompt_embeds = self._encode_prompts(prompts, device)
@@ -96,14 +106,15 @@ class DiffusersSD3Adapter(ModelAdapter):
 
         noise = torch.randn_like(latents)
         bsz = latents.shape[0]
-        timesteps = torch.randint(
+        step_indices = torch.randint(
             0,
-            scheduler.config.num_train_timesteps,
+            scheduler.timesteps.shape[0],
             (bsz,),
             device=device,
             dtype=torch.long,
         )
-        sigmas = self._sigmas_for_timesteps(timesteps, device=device, dtype=latents.dtype)
+        timesteps = scheduler.timesteps.to(device=device)[step_indices]
+        sigmas = scheduler.sigmas.to(device=device, dtype=latents.dtype)[step_indices]
         sigmas = sigmas.view(bsz, *([1] * (latents.ndim - 1)))
 
         noisy_latents = (1.0 - sigmas) * latents + sigmas * noise
@@ -165,41 +176,62 @@ class DiffusersSD3Adapter(ModelAdapter):
         return latents
 
     def _encode_prompts(self, prompts: list[str], device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
-        encoders = [
-            (self.runtime_modules["tokenizer"], self.runtime_modules["text_encoder"]),
-            (self.runtime_modules["tokenizer_2"], self.runtime_modules["text_encoder_2"]),
-            (self.runtime_modules["tokenizer_3"], self.runtime_modules["text_encoder_3"]),
-        ]
-        prompt_embeds_list: list[torch.Tensor] = []
-        pooled_embeds_list: list[torch.Tensor] = []
+        tokenizer = self.runtime_modules["tokenizer"]
+        tokenizer_2 = self.runtime_modules["tokenizer_2"]
+        tokenizer_3 = self.runtime_modules["tokenizer_3"]
+        text_encoder = self.runtime_modules["text_encoder"]
+        text_encoder_2 = self.runtime_modules["text_encoder_2"]
+        text_encoder_3 = self.runtime_modules["text_encoder_3"]
+
+        if (
+            tokenizer is None
+            or tokenizer_2 is None
+            or tokenizer_3 is None
+            or text_encoder is None
+            or text_encoder_2 is None
+            or text_encoder_3 is None
+        ):
+            raise RuntimeError("SD3 prompt encoders/tokenizers must all be available")
 
         with torch.no_grad():
-            for tokenizer, encoder in encoders:
-                if tokenizer is None or encoder is None:
-                    continue
-                text_inputs = tokenizer(
+            clip_prompt_embeds_list: list[torch.Tensor] = []
+            pooled_prompt_embeds_list: list[torch.Tensor] = []
+
+            for current_tokenizer, current_encoder in (
+                (tokenizer, text_encoder),
+                (tokenizer_2, text_encoder_2),
+            ):
+                text_inputs = current_tokenizer(
                     prompts,
                     padding="max_length",
-                    max_length=tokenizer.model_max_length,
+                    max_length=current_tokenizer.model_max_length,
                     truncation=True,
                     return_tensors="pt",
                 )
                 input_ids = text_inputs.input_ids.to(device)
-                outputs = encoder(input_ids, output_hidden_states=True)
-                hidden_states = outputs.hidden_states[-2]
-                pooled = outputs[0]
-                prompt_embeds_list.append(hidden_states)
-                pooled_embeds_list.append(pooled)
+                outputs = current_encoder(input_ids, output_hidden_states=True)
+                pooled_prompt_embeds_list.append(outputs[0])
+                clip_prompt_embeds_list.append(outputs.hidden_states[-2])
 
-        prompt_embeds = torch.cat(prompt_embeds_list, dim=-1)
-        pooled_prompt_embeds = torch.cat(pooled_embeds_list, dim=-1)
+            clip_prompt_embeds = torch.cat(clip_prompt_embeds_list, dim=-1)
+
+            max_sequence_length = 256
+            text_inputs = tokenizer_3(
+                prompts,
+                padding="max_length",
+                max_length=max_sequence_length,
+                truncation=True,
+                add_special_tokens=True,
+                return_tensors="pt",
+            )
+            t5_input_ids = text_inputs.input_ids.to(device)
+            t5_prompt_embeds = text_encoder_3(t5_input_ids)[0]
+
+            clip_prompt_embeds = torch.nn.functional.pad(
+                clip_prompt_embeds,
+                (0, t5_prompt_embeds.shape[-1] - clip_prompt_embeds.shape[-1]),
+            )
+            prompt_embeds = torch.cat([clip_prompt_embeds, t5_prompt_embeds], dim=-2)
+            pooled_prompt_embeds = torch.cat(pooled_prompt_embeds_list, dim=-1)
+
         return prompt_embeds, pooled_prompt_embeds
-
-    def _sigmas_for_timesteps(
-        self, timesteps: torch.Tensor, device: torch.device, dtype: torch.dtype
-    ) -> torch.Tensor:
-        scheduler = self.runtime_modules["noise_scheduler"]
-        scheduler_timesteps = scheduler.timesteps.to(device)
-        scheduler_sigmas = scheduler.sigmas.to(device=device, dtype=dtype)
-        step_indices = [(scheduler_timesteps == t).nonzero().item() for t in timesteps]
-        return scheduler_sigmas[step_indices]

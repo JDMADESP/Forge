@@ -74,7 +74,12 @@ def parse_args() -> TrainingEngineArgs:
 def init_dist() -> None:
     if dist.is_initialized():
         return
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if world_size == 1:
+        return
     backend = "nccl" if torch.cuda.is_available() else "gloo"
+    if backend == "gloo":
+        os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo")
     os.environ.setdefault("RANK", "0")
     os.environ.setdefault("WORLD_SIZE", "1")
     os.environ.setdefault("LOCAL_RANK", "0")
@@ -92,30 +97,34 @@ def set_seed(seed: int) -> None:
 def main() -> None:
     args = parse_args()
     init_dist()
-    set_seed(args.seed)
-    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-    if torch.cuda.is_available():
-        torch.cuda.set_device(local_rank)
+    try:
+        set_seed(args.seed)
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
 
-    dataset = SyntheticTextImageDataset()
-    train_loader = DataLoader(
-        dataset,
-        batch_size=args.train_batch_size,
-        shuffle=False,
-        num_workers=args.dataloader_num_workers,
-        collate_fn=collate_fn,
-    )
+        dataset = SyntheticTextImageDataset()
+        train_loader = DataLoader(
+            dataset,
+            batch_size=args.train_batch_size,
+            shuffle=False,
+            num_workers=args.dataloader_num_workers,
+            collate_fn=collate_fn,
+        )
 
-    adapter = DiffusersSD3Adapter()
-    strategy = FSDPStrategy(mixed_precision=args.mixed_precision)
-    trainer = Trainer(
-        args=args,
-        model_adapter=adapter,
-        strategy=strategy,
-        train_loader=train_loader,
-        optimizer_factory=lambda model: build_optimizer(model, args),
-    )
-    trainer.train()
+        adapter = DiffusersSD3Adapter()
+        strategy = FSDPStrategy(mixed_precision=args.mixed_precision)
+        trainer = Trainer(
+            args=args,
+            model_adapter=adapter,
+            strategy=strategy,
+            train_loader=train_loader,
+            optimizer_factory=lambda model: build_optimizer(model, args),
+        )
+        trainer.train()
+    finally:
+        if dist.is_available() and dist.is_initialized():
+            dist.destroy_process_group()
 
 
 if __name__ == "__main__":
