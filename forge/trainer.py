@@ -65,6 +65,9 @@ class Trainer:
 
         for epoch in range(self.state.epoch, self.args.num_train_epochs):
             self.state.epoch = epoch
+            sampler = getattr(self.train_loader, "sampler", None)
+            if sampler is not None and hasattr(sampler, "set_epoch"):
+                sampler.set_epoch(epoch)
             for raw_batch in self.train_loader:
                 if resume_micro_step > 0:
                     resume_micro_step -= 1
@@ -82,7 +85,8 @@ class Trainer:
                     loss_value = out.get("metrics", {}).get("loss")
                     if loss_value is None:
                         loss_value = float(loss.detach().item() * accumulation)
-                    print(f"[train] step={self.state.global_step} loss={loss_value:.6f}", flush=True)
+                    if self.strategy.is_main_process():
+                        print(f"[train] step={self.state.global_step} loss={loss_value:.6f}", flush=True)
 
                     if self._should_validate():
                         self.validate()
@@ -97,6 +101,7 @@ class Trainer:
             return self.model_adapter.validation_generate(
                 prompts=self.args.validation_prompts,
                 output_dir=str(self.args.output_path() / "validation"),
+                seed=self.args.seed,
             )
         finally:
             self.model.train()
@@ -108,7 +113,8 @@ class Trainer:
             "global_step": self.state.global_step,
         }
         self.strategy.save(str(ckpt_dir), payload)
-        self._save_rng_state(ckpt_dir)
+        if self.strategy.is_main_process():
+            self._save_rng_state(ckpt_dir)
 
     def _should_checkpoint(self) -> bool:
         every = self.args.checkpoint_every_n_steps

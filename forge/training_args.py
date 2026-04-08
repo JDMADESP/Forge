@@ -8,6 +8,7 @@ from pathlib import Path
 class TrainingEngineArgs:
     model_name_or_path: str
     output_dir: str = "outputs/m0_sd3_fsdp"
+    train_fixture_dir: str | None = None
     train_batch_size: int = 1
     gradient_accumulation_steps: int = 1
     learning_rate: float = 1e-5

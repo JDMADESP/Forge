@@ -3,43 +3,17 @@ from __future__ import annotations
 import argparse
 import os
 import random
-from typing import Any
 
 import torch
 import torch.distributed as dist
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 
-from forge.adapters import DiffusersSD3Adapter
+from forge.adapters import SD3DiTAdapter
+from forge.data import LatentFixtureDataset, collate_latent_fixtures
 from forge.parallel import FSDPStrategy
 from forge.trainer import Trainer
 from forge.training_args import TrainingEngineArgs
-
-
-class SyntheticTextImageDataset(Dataset):
-    def __init__(self, length: int = 16, image_size: int = 1024) -> None:
-        self.length = length
-        self.image_size = image_size
-        self.prompts = [
-            "a clean poster that says FORGE",
-            "a printed receipt with legible OCR-friendly text",
-            "a bookstore sign that says OPEN TODAY",
-        ]
-
-    def __len__(self) -> int:
-        return self.length
-
-    def __getitem__(self, index: int) -> dict[str, Any]:
-        gen = torch.Generator().manual_seed(index)
-        pixel_values = torch.randn((3, self.image_size, self.image_size), generator=gen)
-        prompt = self.prompts[index % len(self.prompts)]
-        return {"pixel_values": pixel_values, "prompts": prompt}
-
-
-def collate_fn(items: list[dict[str, Any]]) -> dict[str, Any]:
-    return {
-        "pixel_values": torch.stack([item["pixel_values"] for item in items], dim=0),
-        "prompts": [item["prompts"] for item in items],
-    }
 
 
 def build_optimizer(model: torch.nn.Module, args: TrainingEngineArgs) -> torch.optim.Optimizer:
@@ -52,9 +26,10 @@ def build_optimizer(model: torch.nn.Module, args: TrainingEngineArgs) -> torch.o
 
 
 def parse_args() -> TrainingEngineArgs:
-    parser = argparse.ArgumentParser(description="M0 SD3 T2I FSDP trainer")
+    parser = argparse.ArgumentParser(description="M0 SD3 DiT-only FSDP trainer")
     parser.add_argument("--model_name_or_path", required=True)
     parser.add_argument("--output_dir", default="outputs/m0_sd3_fsdp")
+    parser.add_argument("--train_fixture_dir", required=True)
     parser.add_argument("--train_batch_size", type=int, default=1)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--learning_rate", type=float, default=1e-5)
@@ -103,16 +78,20 @@ def main() -> None:
         if torch.cuda.is_available():
             torch.cuda.set_device(local_rank)
 
-        dataset = SyntheticTextImageDataset()
+        dataset = LatentFixtureDataset(args.train_fixture_dir)
+        sampler = None
+        if dist.is_available() and dist.is_initialized():
+            sampler = DistributedSampler(dataset, shuffle=False)
         train_loader = DataLoader(
             dataset,
             batch_size=args.train_batch_size,
-            shuffle=False,
+            shuffle=False if sampler is not None else False,
+            sampler=sampler,
             num_workers=args.dataloader_num_workers,
-            collate_fn=collate_fn,
+            collate_fn=collate_latent_fixtures,
         )
 
-        adapter = DiffusersSD3Adapter()
+        adapter = SD3DiTAdapter()
         strategy = FSDPStrategy(mixed_precision=args.mixed_precision)
         trainer = Trainer(
             args=args,

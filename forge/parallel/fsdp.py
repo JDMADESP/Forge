@@ -34,16 +34,25 @@ class FSDPStrategy(ParallelStrategy):
         self.mixed_precision = mixed_precision
         self.model: Any | None = None
         self.optimizer: Any | None = None
+        self.use_fsdp = False
 
     def prepare_model(self, model: Any) -> Any:
         if FSDP is None or dist is None:
             raise RuntimeError("FSDP is unavailable in this environment") from _FSDP_IMPORT_ERROR
-        if not dist.is_initialized():
-            raise RuntimeError("torch.distributed must be initialized before FSDPStrategy.prepare_model")
-
-        device = torch.device("cuda", int(os.environ.get("LOCAL_RANK", "0")))
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
+        if torch.cuda.is_available():
+            device = torch.device("cuda", int(os.environ.get("LOCAL_RANK", "0")))
+        else:
+            device = torch.device("cpu")
         model.to(device)
+
+        if not dist.is_initialized() or world_size == 1:
+            self.use_fsdp = False
+            self.model = model
+            return model
+
         mp_policy = self._build_mixed_precision()
+        self.use_fsdp = True
         self.model = FSDP(
             model,
             device_id=device,
@@ -70,13 +79,26 @@ class FSDPStrategy(ParallelStrategy):
 
     def clip_grad_norm_(self, model: Any, max_norm: float) -> None:
         if max_norm > 0:
-            model.clip_grad_norm_(max_norm)
+            if self.use_fsdp:
+                model.clip_grad_norm_(max_norm)
+            else:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
 
     def save(self, path: str, state: dict[str, Any]) -> None:
         if self.model is None:
             raise RuntimeError("Model has not been prepared")
         ckpt_dir = Path(path)
         ckpt_dir.mkdir(parents=True, exist_ok=True)
+        torch.save(state, ckpt_dir / "trainer_meta.pt")
+        if not self.use_fsdp:
+            torch.save(
+                {
+                    "model": self.model.state_dict(),
+                    "optimizer": self.optimizer.state_dict() if self.optimizer is not None else {},
+                },
+                ckpt_dir / "checkpoint.pt",
+            )
+            return
         state_dict = {
             "model": get_model_state_dict(
                 self.model,
@@ -87,11 +109,19 @@ class FSDPStrategy(ParallelStrategy):
                 self.optimizer,
                 options=StateDictOptions(full_state_dict=False, cpu_offload=True),
             ) if self.optimizer is not None else {},
-            "meta": state,
         }
         dcp_save(state_dict=state_dict, checkpoint_id=ckpt_dir)
 
     def load(self, path: str, model: Any, optimizer: Any | None = None) -> dict[str, Any]:
+        ckpt_dir = Path(path)
+        meta_path = ckpt_dir / "trainer_meta.pt"
+        meta = torch.load(meta_path, map_location="cpu") if meta_path.exists() else {}
+        if not self.use_fsdp:
+            checkpoint = torch.load(ckpt_dir / "checkpoint.pt", map_location="cpu")
+            model.load_state_dict(checkpoint["model"])
+            if optimizer is not None and checkpoint.get("optimizer"):
+                optimizer.load_state_dict(checkpoint["optimizer"])
+            return meta
         state_dict = {
             "model": get_model_state_dict(
                 model,
@@ -102,9 +132,8 @@ class FSDPStrategy(ParallelStrategy):
                 optimizer,
                 options=StateDictOptions(full_state_dict=False, cpu_offload=True),
             ) if optimizer is not None else {},
-            "meta": {},
         }
-        dcp_load(state_dict=state_dict, checkpoint_id=Path(path))
+        dcp_load(state_dict=state_dict, checkpoint_id=ckpt_dir)
         set_model_state_dict(model, model_state_dict=state_dict["model"])
         if optimizer is not None:
             set_optimizer_state_dict(
@@ -112,7 +141,7 @@ class FSDPStrategy(ParallelStrategy):
                 optimizer,
                 optim_state_dict=state_dict["optimizer"],
             )
-        return state_dict["meta"]
+        return meta
 
     def _build_mixed_precision(self) -> Any:
         if self.mixed_precision == "bf16":
@@ -121,4 +150,16 @@ class FSDPStrategy(ParallelStrategy):
             dtype = torch.float16
         else:
             dtype = torch.float32
-        return MixedPrecision(param_dtype=torch.float32, reduce_dtype=dtype, buffer_dtype=dtype)
+        return MixedPrecision(param_dtype=dtype, reduce_dtype=dtype, buffer_dtype=dtype)
+
+    def is_main_process(self) -> bool:
+        if dist is None or not dist.is_available() or not dist.is_initialized():
+            return True
+        return dist.get_rank() == 0
+
+    def is_distributed(self) -> bool:
+        return bool(dist is not None and dist.is_available() and dist.is_initialized())
+
+    def barrier(self) -> None:
+        if self.is_distributed():
+            dist.barrier()

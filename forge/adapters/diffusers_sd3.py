@@ -104,16 +104,27 @@ class DiffusersSD3Adapter(ModelAdapter):
         prompt_embeds = prompt_embeds.to(device=device, dtype=dtype)
         pooled_prompt_embeds = pooled_prompt_embeds.to(device=device, dtype=dtype)
 
-        noise = torch.randn_like(latents)
         bsz = latents.shape[0]
-        step_indices = torch.randint(
-            0,
-            scheduler.timesteps.shape[0],
-            (bsz,),
-            device=device,
-            dtype=torch.long,
-        )
-        timesteps = scheduler.timesteps.to(device=device)[step_indices]
+        noise = batch_state.raw_batch.get("noise")
+        if noise is None:
+            noise = torch.randn_like(latents)
+        else:
+            noise = noise.to(device=device, dtype=latents.dtype)
+
+        raw_timesteps = batch_state.raw_batch.get("timesteps")
+        if raw_timesteps is None:
+            step_indices = torch.randint(
+                0,
+                scheduler.timesteps.shape[0],
+                (bsz,),
+                device=device,
+                dtype=torch.long,
+            )
+            timesteps = scheduler.timesteps.to(device=device)[step_indices]
+        else:
+            timesteps = raw_timesteps.to(device=device)
+            step_indices = self._step_indices_for_timesteps(timesteps, scheduler, device=device)
+
         sigmas = scheduler.sigmas.to(device=device, dtype=latents.dtype)[step_indices]
         sigmas = sigmas.view(bsz, *([1] * (latents.ndim - 1)))
 
@@ -132,7 +143,13 @@ class DiffusersSD3Adapter(ModelAdapter):
         batch_state.metrics["loss"] = float(loss.detach().item())
         return {"loss": loss, "metrics": batch_state.metrics, "artifacts": batch_state.artifacts}
 
-    def validation_generate(self, prompts: list[str], output_dir: str) -> dict[str, Any]:
+    def validation_generate(
+        self,
+        prompts: list[str],
+        output_dir: str,
+        seed: int | None = None,
+        generator: Any | None = None,
+    ) -> dict[str, Any]:
         if self.pipeline is None or self.primary_train_model is None:
             raise RuntimeError("build_modules must be called before validation_generate")
         if dist.is_available() and dist.is_initialized() and dist.get_rank() != 0:
@@ -152,12 +169,17 @@ class DiffusersSD3Adapter(ModelAdapter):
             )
 
         images: list[str] = []
+        transformer_device = next(transformer.parameters()).device
         with full_param_context, torch.no_grad():
             for index, prompt in enumerate(prompts):
+                sample_generator = generator
+                if sample_generator is None and seed is not None:
+                    sample_generator = torch.Generator(device=transformer_device).manual_seed(seed + index)
                 image = self.pipeline(
                     prompt=prompt,
                     num_inference_steps=20,
                     guidance_scale=4.5,
+                    generator=sample_generator,
                 ).images[0]
                 image_path = output_path / f"sample_{index:03d}.png"
                 image.save(image_path)
@@ -235,3 +257,18 @@ class DiffusersSD3Adapter(ModelAdapter):
             pooled_prompt_embeds = torch.cat(pooled_prompt_embeds_list, dim=-1)
 
         return prompt_embeds, pooled_prompt_embeds
+
+    def _step_indices_for_timesteps(
+        self,
+        timesteps: torch.Tensor,
+        scheduler: Any,
+        device: torch.device,
+    ) -> torch.Tensor:
+        scheduler_timesteps = scheduler.timesteps.to(device=device, dtype=timesteps.dtype)
+        step_indices: list[int] = []
+        for timestep in timesteps:
+            matches = (scheduler_timesteps == timestep).nonzero(as_tuple=False)
+            if matches.numel() == 0:
+                raise ValueError(f"Provided timestep {float(timestep.item())} is not present in scheduler.timesteps")
+            step_indices.append(int(matches[0].item()))
+        return torch.tensor(step_indices, device=device, dtype=torch.long)

@@ -32,6 +32,15 @@ class ParallelStrategy(ABC):
     def clip_grad_norm_(self, model: Any, max_norm: float) -> None:
         del model, max_norm
 
+    def is_main_process(self) -> bool:
+        return True
+
+    def is_distributed(self) -> bool:
+        return False
+
+    def barrier(self) -> None:
+        return None
+
     def apply_plan(self, model: Any, plan: Any | None = None) -> Any:
         del plan
         return model

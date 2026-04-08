@@ -22,7 +22,13 @@ class ModelAdapter(ABC):
         """Run one training forward pass and return loss plus metadata."""
 
     @abstractmethod
-    def validation_generate(self, prompts: list[str], output_dir: str) -> dict[str, Any]:
+    def validation_generate(
+        self,
+        prompts: list[str],
+        output_dir: str,
+        seed: int | None = None,
+        generator: Any | None = None,
+    ) -> dict[str, Any]:
         """Generate validation artifacts for a fixed prompt set."""
 
     # used after a model is wrapped by the strategy like FSDP
