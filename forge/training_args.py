@@ -3,10 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from forge.parallel.config import ParallelConfig
+
 
 @dataclass
 class TrainingEngineArgs:
     model_name_or_path: str
+    model_family: str = "sd3"
     output_dir: str = "outputs/m0_sd3_fsdp"
     train_fixture_dir: str | None = None
     train_batch_size: int = 1
@@ -29,6 +32,15 @@ class TrainingEngineArgs:
     log_samples: bool = True
     validation_prompts: list[str] = field(
         default_factory=lambda: ["a clean OCR-style poster that says FORGE"])
+    parallel_backend: str = "torch"
+    dp_mode: str = "fsdp1"
 
     def output_path(self) -> Path:
         return Path(self.output_dir)
+
+    def parallel_config(self) -> ParallelConfig:
+        return ParallelConfig(
+            backend=self.parallel_backend,
+            dp_mode=self.dp_mode,
+            mixed_precision=self.mixed_precision,
+        )

@@ -6,7 +6,7 @@ from typing import Any
 
 import torch
 
-from forge.parallel.base import ParallelStrategy
+from forge.parallel.base import ParallelRuntime
 
 try:
     import torch.distributed as dist
@@ -21,7 +21,7 @@ try:
     )
     from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
     from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
-except Exception as exc:  # pragma: no cover - import guard for local environments
+except Exception as exc:  # pragma: no cover
     dist = None
     FSDP = None
     _FSDP_IMPORT_ERROR = exc
@@ -29,14 +29,18 @@ else:
     _FSDP_IMPORT_ERROR = None
 
 
-class FSDPStrategy(ParallelStrategy):
+class TorchFSDP1ParallelRuntime(ParallelRuntime):
     def __init__(self, mixed_precision: str = "bf16") -> None:
         self.mixed_precision = mixed_precision
         self.model: Any | None = None
         self.optimizer: Any | None = None
         self.use_fsdp = False
 
-    def prepare_model(self, model: Any) -> Any:
+    def setup(self) -> None:
+        return None
+
+    def parallelize_model(self, model: Any, plan: dict[str, Any]) -> Any:
+        del plan
         if FSDP is None or dist is None:
             raise RuntimeError("FSDP is unavailable in this environment") from _FSDP_IMPORT_ERROR
         world_size = dist.get_world_size() if dist.is_initialized() else 1
@@ -67,6 +71,10 @@ class FSDPStrategy(ParallelStrategy):
         del model
         self.optimizer = optimizer
         return optimizer
+
+    def redistribute_batch(self, batch: Any, plan: dict[str, Any]) -> Any:
+        del plan
+        return batch
 
     def backward(self, loss: Any) -> None:
         loss.backward()
@@ -163,3 +171,4 @@ class FSDPStrategy(ParallelStrategy):
     def barrier(self) -> None:
         if self.is_distributed():
             dist.barrier()
+

@@ -9,9 +9,8 @@ import torch.distributed as dist
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
-from forge.adapters import SD3DiTAdapter
+from forge.core import create_core
 from forge.data import LatentFixtureDataset, collate_latent_fixtures
-from forge.parallel import FSDPStrategy
 from forge.trainer import Trainer
 from forge.training_args import TrainingEngineArgs
 
@@ -91,12 +90,14 @@ def main() -> None:
             collate_fn=collate_latent_fixtures,
         )
 
-        adapter = SD3DiTAdapter()
-        strategy = FSDPStrategy(mixed_precision=args.mixed_precision)
+        core = create_core(
+            model_family=args.model_family,
+            model_name_or_path=args.model_name_or_path,
+            parallel_config=args.parallel_config(),
+        )
         trainer = Trainer(
             args=args,
-            model_adapter=adapter,
-            strategy=strategy,
+            core=core,
             train_loader=train_loader,
             optimizer_factory=lambda model: build_optimizer(model, args),
         )
