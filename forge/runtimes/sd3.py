@@ -5,14 +5,7 @@ from pathlib import Path
 from typing import Any
 
 import torch.nn as nn
-
-try:
-    from diffusers import FlowMatchEulerDiscreteScheduler
-except Exception as exc:  # pragma: no cover
-    FlowMatchEulerDiscreteScheduler = None
-    _DIFFUSERS_IMPORT_ERROR = exc
-else:
-    _DIFFUSERS_IMPORT_ERROR = None
+from diffusers import FlowMatchEulerDiscreteScheduler
 
 from forge.architectures.sd3 import SD3Architecture
 from forge.batch import DenoiseBatch
@@ -39,9 +32,6 @@ class SD3Runtime(ModelRuntime):
         return self.architecture.build_model()
 
     def load_weights(self, model: nn.Module) -> dict[str, Any]:
-        if FlowMatchEulerDiscreteScheduler is None:
-            raise RuntimeError("diffusers scheduler is unavailable") from _DIFFUSERS_IMPORT_ERROR
-
         pretrained = type(model).from_pretrained(self.model_name_or_path, subfolder="transformer")
         model.load_state_dict(pretrained.state_dict())
         del pretrained
@@ -58,16 +48,17 @@ class SD3Runtime(ModelRuntime):
         return self.runtime_modules
 
     def canonicalize_batch(self, raw_batch: dict[str, Any]) -> DenoiseBatch:
-        latents = raw_batch.get("latents", raw_batch.get("latent"))
-        prompt_embeds = raw_batch.get("prompt_embeds", raw_batch.get("prompt_embed"))
-        pooled_embeds = raw_batch.get("pooled_embeds", raw_batch.get("pooled_prompt_embed"))
-        missing: list[str] = []
-        if latents is None:
-            missing.append("latents")
-        if prompt_embeds is None:
-            missing.append("prompt_embeds")
-        if pooled_embeds is None:
-            missing.append("pooled_embeds")
+        # might need refactor here
+        values = {
+            "latents": raw_batch.get("latents", raw_batch.get("latent")),
+            "prompt_embeds": raw_batch.get("prompt_embeds", raw_batch.get("prompt_embed")),
+            "pooled_embeds": raw_batch.get("pooled_embeds", raw_batch.get("pooled_prompt_embed")),
+        }
+        missing = [
+            field
+            for field in self.architecture.condition_schema.required_fields
+            if values.get(field) is None
+        ]
         if missing:
             raise ValueError(f"Raw batch is missing required fields: {missing}")
 
@@ -76,9 +67,9 @@ class SD3Runtime(ModelRuntime):
             sample_ids = [sample_ids]
 
         return DenoiseBatch(
-            latents=latents,
-            prompt_embeds=prompt_embeds,
-            pooled_embeds=pooled_embeds,
+            latents=values["latents"],
+            prompt_embeds=values["prompt_embeds"],
+            pooled_embeds=values["pooled_embeds"],
             timesteps=raw_batch.get("timesteps"),
             noise=raw_batch.get("noise"),
             attention_mask=raw_batch.get("attention_mask"),

@@ -16,8 +16,10 @@ class ConditionSchema:
 
 @dataclass(frozen=True)
 class ArchitectureParallelSpec:
+    # what is the wrap basic unit
     wrap_block_classes: tuple[str, ...] = ()
     no_shard_modules: tuple[str, ...] = ()
+    # inputs: dimenstion, indicating what dimension to shard on, reserved for future SP
     shardable_inputs: dict[str, int] = field(default_factory=dict)
     replicate_inputs: tuple[str, ...] = ()
 

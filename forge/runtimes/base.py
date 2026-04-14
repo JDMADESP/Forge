@@ -23,6 +23,7 @@ class ModelRuntime(ABC):
     def load_weights(self, model: nn.Module) -> dict[str, Any]:
         """Load weights and return auxiliary runtime modules."""
 
+    # might be redundant; can be directly mapped to Sample
     @abstractmethod
     def canonicalize_batch(self, raw_batch: dict[str, Any]) -> DenoiseBatch:
         """Convert upstream inputs into a canonical DenoiseBatch."""

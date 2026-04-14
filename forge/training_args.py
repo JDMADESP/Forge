@@ -20,8 +20,6 @@ class TrainingEngineArgs:
     num_train_epochs: int = 1
     checkpoint_every_n_steps: int = 100
     validation_every_n_steps: int = 100
-    # used for grad clipping
-    max_grad_norm: float = 1.0
     mixed_precision: str = "bf16"
     seed: int = 42
     # which gpu to use, -1 for cpu

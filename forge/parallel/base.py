@@ -19,7 +19,7 @@ class ParallelRuntime(ABC):
 
     @abstractmethod
     def redistribute_batch(self, batch: Any, plan: dict[str, Any]) -> Any:
-        """Redistribute a canonical batch according to the internal plan."""
+        """Redistribute a canonical batch according to the internal plan. For SP use"""
 
     @abstractmethod
     def backward(self, loss: Any) -> None:
@@ -36,9 +36,6 @@ class ParallelRuntime(ABC):
     @abstractmethod
     def load(self, path: str, model: Any, optimizer: Any | None = None) -> dict[str, Any]:
         """Load runtime-managed state and return trainer metadata."""
-
-    def clip_grad_norm_(self, model: Any, max_norm: float) -> None:
-        del model, max_norm
 
     def is_main_process(self) -> bool:
         return True

@@ -94,7 +94,6 @@ class Trainer:
                 micro_step += 1
 
                 if micro_step % accumulation == 0:
-                    self.parallel_runtime.clip_grad_norm_(self.model, self.args.max_grad_norm)
                     self.parallel_runtime.step(self.optimizer, self.scheduler)
                     self.state.global_step += 1
 

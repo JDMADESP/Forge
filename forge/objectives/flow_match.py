@@ -71,6 +71,7 @@ class FlowMatchObjective(TrainingObjective):
         artifacts = {"sample_ids": batch.sample_ids}
         return loss, metrics, artifacts
 
+    # might need to refactor here
     @staticmethod
     def _resolve_timesteps(
         timesteps: torch.Tensor,

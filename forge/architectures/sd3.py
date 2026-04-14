@@ -4,14 +4,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch.nn as nn
-
-try:
-    from diffusers.models.transformers.transformer_sd3 import SD3Transformer2DModel
-except Exception as exc:  # pragma: no cover
-    SD3Transformer2DModel = None
-    _DIFFUSERS_IMPORT_ERROR = exc
-else:
-    _DIFFUSERS_IMPORT_ERROR = None
+from diffusers.models.transformers.transformer_sd3 import SD3Transformer2DModel
 
 from forge.architectures.base import (
     ArchitectureParallelSpec,
@@ -44,6 +37,4 @@ class SD3Architecture(ModelArchitecture):
         )
 
     def build_model(self) -> nn.Module:
-        if SD3Transformer2DModel is None:
-            raise RuntimeError("diffusers SD3 transformer is unavailable") from _DIFFUSERS_IMPORT_ERROR
         return SD3Transformer2DModel.from_config(self.transformer_config)

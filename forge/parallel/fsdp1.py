@@ -5,28 +5,20 @@ from pathlib import Path
 from typing import Any
 
 import torch
+import torch.distributed as dist
+from torch.distributed.checkpoint import load as dcp_load
+from torch.distributed.checkpoint import save as dcp_save
+from torch.distributed.checkpoint.state_dict import (
+    StateDictOptions,
+    get_model_state_dict,
+    get_optimizer_state_dict,
+    set_model_state_dict,
+    set_optimizer_state_dict,
+)
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
 
 from forge.parallel.base import ParallelRuntime
-
-try:
-    import torch.distributed as dist
-    from torch.distributed.checkpoint import load as dcp_load
-    from torch.distributed.checkpoint import save as dcp_save
-    from torch.distributed.checkpoint.state_dict import (
-        StateDictOptions,
-        get_model_state_dict,
-        get_optimizer_state_dict,
-        set_model_state_dict,
-        set_optimizer_state_dict,
-    )
-    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-    from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
-except Exception as exc:  # pragma: no cover
-    dist = None
-    FSDP = None
-    _FSDP_IMPORT_ERROR = exc
-else:
-    _FSDP_IMPORT_ERROR = None
 
 
 class TorchFSDP1ParallelRuntime(ParallelRuntime):
@@ -41,8 +33,6 @@ class TorchFSDP1ParallelRuntime(ParallelRuntime):
 
     def parallelize_model(self, model: Any, plan: dict[str, Any]) -> Any:
         del plan
-        if FSDP is None or dist is None:
-            raise RuntimeError("FSDP is unavailable in this environment") from _FSDP_IMPORT_ERROR
         world_size = dist.get_world_size() if dist.is_initialized() else 1
         if torch.cuda.is_available():
             device = torch.device("cuda", int(os.environ.get("LOCAL_RANK", "0")))
@@ -76,6 +66,7 @@ class TorchFSDP1ParallelRuntime(ParallelRuntime):
         del plan
         return batch
 
+    # For FSDP1, we can just call backward and step on the wrapped model and optimizer
     def backward(self, loss: Any) -> None:
         loss.backward()
 
@@ -84,13 +75,6 @@ class TorchFSDP1ParallelRuntime(ParallelRuntime):
         optimizer.zero_grad(set_to_none=True)
         if scheduler is not None:
             scheduler.step()
-
-    def clip_grad_norm_(self, model: Any, max_norm: float) -> None:
-        if max_norm > 0:
-            if self.use_fsdp:
-                model.clip_grad_norm_(max_norm)
-            else:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
 
     def save(self, path: str, state: dict[str, Any]) -> None:
         if self.model is None:
@@ -171,4 +155,3 @@ class TorchFSDP1ParallelRuntime(ParallelRuntime):
     def barrier(self) -> None:
         if self.is_distributed():
             dist.barrier()
-
