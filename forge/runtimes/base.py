@@ -8,6 +8,7 @@ import torch.nn as nn
 from forge.architectures.base import ModelArchitecture
 from forge.batch import DenoiseBatch
 from forge.parallel.config import ParallelConfig
+from forge.parallel.plan import ParallelPlan
 
 
 class ModelRuntime(ABC):
@@ -33,6 +34,5 @@ class ModelRuntime(ABC):
         """Prepare model.forward kwargs."""
 
     @abstractmethod
-    def make_parallel_plan(self, parallel_config: ParallelConfig, batch: DenoiseBatch | None = None) -> dict[str, Any]:
+    def make_parallel_plan(self, parallel_config: ParallelConfig, batch: DenoiseBatch | None = None) -> ParallelPlan:
         """Build an internal parallel plan for the current model family."""
-

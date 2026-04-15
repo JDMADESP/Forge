@@ -10,6 +10,7 @@ from forge.architectures.base import (
     ArchitectureParallelSpec,
     ConditionSchema,
     ModelArchitecture,
+    PatchedSequenceParallelSpec,
 )
 
 
@@ -34,6 +35,10 @@ class SD3Architecture(ModelArchitecture):
             no_shard_modules=("pos_embed", "time_text_embed"),
             shardable_inputs={"prompt_embeds": 1},
             replicate_inputs=("pooled_embeds", "timesteps"),
+            patched_sequence_parallel=PatchedSequenceParallelSpec(
+                required_batch_extras=("prompt_embeds",),
+                patch_entrypoint="joint_attention_processor",
+            ),
         )
 
     def build_model(self) -> nn.Module:

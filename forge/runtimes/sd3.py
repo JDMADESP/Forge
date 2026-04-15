@@ -5,11 +5,12 @@ from pathlib import Path
 from typing import Any
 
 import torch.nn as nn
-from diffusers import FlowMatchEulerDiscreteScheduler
+from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
 
 from forge.architectures.sd3 import SD3Architecture
 from forge.batch import DenoiseBatch
 from forge.parallel.config import ParallelConfig
+from forge.parallel.plan import ParallelPlan, StrategySpec
 from forge.runtimes.base import ModelRuntime
 
 
@@ -87,15 +88,30 @@ class SD3Runtime(ModelRuntime):
             "return_dict": False,
         }
 
-    def make_parallel_plan(self, parallel_config: ParallelConfig, batch: DenoiseBatch | None = None) -> dict[str, Any]:
+    def make_parallel_plan(self, parallel_config: ParallelConfig, batch: DenoiseBatch | None = None) -> ParallelPlan:
         del batch
-        spec = self.architecture.parallel_spec
-        return {
-            "backend": parallel_config.backend,
-            "dp_mode": parallel_config.dp_mode,
-            "fsdp1_enabled": parallel_config.dp_mode == "fsdp1",
-            "wrap_block_classes": spec.wrap_block_classes,
-            "no_shard_modules": spec.no_shard_modules,
-            "shard_inputs": spec.shardable_inputs,
-            "replicate_inputs": spec.replicate_inputs,
-        }
+        strategies: list[StrategySpec] = []
+        parameter_parallel = parallel_config.parameter_parallel
+        if parameter_parallel is not None and parameter_parallel.mode == "fsdp1":
+            strategies.append(
+                StrategySpec(
+                    kind="fsdp1",
+                    config={
+                        "degree": parameter_parallel.degree,
+                        "wrap_block_classes": self.architecture.parallel_spec.wrap_block_classes,
+                        "no_shard_modules": self.architecture.parallel_spec.no_shard_modules,
+                    },
+                )
+            )
+
+        sequence_parallel = parallel_config.sequence_parallel
+        if sequence_parallel.mode not in {"none", "auto"}:
+            raise NotImplementedError("SD3 native/patched sequence parallel is not implemented yet.")
+
+        return ParallelPlan(
+            parameter_degree=parameter_parallel.degree if parameter_parallel is not None else 1,
+            sequence_degree=sequence_parallel.degree,
+            strategy_order=tuple(strategy.kind for strategy in strategies),
+            strategies=tuple(strategies),
+            required_batch_extras=(),
+        )

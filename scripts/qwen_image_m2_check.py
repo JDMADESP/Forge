@@ -1,0 +1,735 @@
+from __future__ import annotations
+
+import argparse
+import copy
+import json
+import os
+import socket
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
+import torch.nn.functional as F
+
+
+ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_OUTPUT_DIR = ROOT / "outputs" / "m2_qwen_image_check"
+VENDORED_DIFFUSERS_SRC = ROOT / "diffusers" / "src"
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+if VENDORED_DIFFUSERS_SRC.exists():
+    sys.path.insert(0, str(VENDORED_DIFFUSERS_SRC))
+
+import transformers
+
+if not hasattr(transformers, "AutoImageProcessor"):
+    class _AutoImageProcessorStub:
+        @classmethod
+        def from_pretrained(cls, *args, **kwargs):
+            raise NotImplementedError("AutoImageProcessor is unavailable in this transformers build.")
+
+    transformers.AutoImageProcessor = _AutoImageProcessorStub
+
+from diffusers.models.transformers.transformer_qwenimage import QwenImageTransformer2DModel
+from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
+
+from forge.core import create_core
+from forge.objectives.flow_match import FlowMatchObjective
+from forge.parallel.config import ParallelConfig, SequenceParallelConfig
+
+
+def find_free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("", 0))
+        sock.listen(1)
+        return int(sock.getsockname()[1])
+
+
+def derive_axes_dims_rope(head_dim: int) -> tuple[int, int, int]:
+    if head_dim % 8 != 0:
+        raise ValueError(f"attention_head_dim must be divisible by 8, got {head_dim}")
+    frame_dim = max(2, head_dim // 8)
+    if frame_dim % 2 != 0:
+        frame_dim += 1
+    spatial_total = head_dim - frame_dim
+    height_dim = spatial_total // 2
+    if height_dim % 2 != 0:
+        height_dim -= 1
+    width_dim = head_dim - frame_dim - height_dim
+    if min(frame_dim, height_dim, width_dim) <= 0 or width_dim % 2 != 0:
+        raise ValueError(
+            f"Unable to derive valid rope axes for attention_head_dim={head_dim}: "
+            f"{(frame_dim, height_dim, width_dim)}"
+        )
+    return frame_dim, height_dim, width_dim
+
+
+def ensure_qwen_image_checkpoint(
+    root: Path,
+    *,
+    patch_size: int,
+    latent_channels: int,
+    out_channels: int,
+    num_layers: int,
+    num_heads: int,
+    head_dim: int,
+    joint_dim: int,
+) -> Path:
+    transformer_config = root / "transformer" / "config.json"
+    scheduler_config = root / "scheduler" / "scheduler_config.json"
+    if transformer_config.exists() and scheduler_config.exists():
+        return root
+
+    root.mkdir(parents=True, exist_ok=True)
+    torch.manual_seed(0)
+    model = QwenImageTransformer2DModel(
+        patch_size=patch_size,
+        in_channels=latent_channels,
+        out_channels=out_channels,
+        num_layers=num_layers,
+        attention_head_dim=head_dim,
+        num_attention_heads=num_heads,
+        joint_attention_dim=joint_dim,
+        guidance_embeds=False,
+        axes_dims_rope=derive_axes_dims_rope(head_dim),
+    )
+    scheduler = FlowMatchEulerDiscreteScheduler(num_train_timesteps=1000)
+    model.save_pretrained(root / "transformer", safe_serialization=False)
+    scheduler.save_pretrained(root / "scheduler")
+    return root
+
+
+def inspect_visible_gpus() -> list[dict[str, Any]]:
+    gpus: list[dict[str, Any]] = []
+    for index in range(torch.cuda.device_count()):
+        free_bytes, total_bytes = torch.cuda.mem_get_info(index)
+        used_bytes = total_bytes - free_bytes
+        gpus.append(
+            {
+                "local_rank": index,
+                "name": torch.cuda.get_device_name(index),
+                "free_gb": round(free_bytes / (1024**3), 2),
+                "used_gb": round(used_bytes / (1024**3), 2),
+                "total_gb": round(total_bytes / (1024**3), 2),
+            }
+        )
+    return gpus
+
+
+def run_gpu_preflight(world_size: int, min_free_gb_per_gpu: float) -> dict[str, Any]:
+    if not torch.cuda.is_available():
+        return {
+            "status": "error",
+            "error": "CUDA is unavailable.",
+            "visible_gpus": [],
+        }
+
+    visible_gpus = inspect_visible_gpus()
+    if len(visible_gpus) < world_size:
+        return {
+            "status": "error",
+            "error": f"Visible CUDA devices ({len(visible_gpus)}) < sp_world_size ({world_size})",
+            "visible_gpus": visible_gpus,
+        }
+
+    selected = visible_gpus[:world_size]
+    too_busy = [gpu for gpu in selected if gpu["free_gb"] < min_free_gb_per_gpu]
+    if too_busy:
+        ranks = [gpu["local_rank"] for gpu in too_busy]
+        return {
+            "status": "error",
+            "error": (
+                f"Visible local ranks {ranks} do not meet min_free_gb_per_gpu={min_free_gb_per_gpu}. "
+                f"Use CUDA_VISIBLE_DEVICES to target freer GPUs."
+            ),
+            "visible_gpus": visible_gpus,
+            "selected_gpus": selected,
+        }
+
+    return {
+        "status": "success",
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+        "min_free_gb_per_gpu": min_free_gb_per_gpu,
+        "visible_gpus": visible_gpus,
+        "selected_gpus": selected,
+    }
+
+
+def make_raw_batches(
+    *,
+    steps: int,
+    batch_size: int,
+    height: int,
+    width: int,
+    prompt_len: int,
+    latent_channels: int,
+    prompt_dim: int,
+    seed: int,
+) -> list[dict[str, Any]]:
+    generator = torch.Generator(device="cpu").manual_seed(seed)
+    batches: list[dict[str, Any]] = []
+    seq_len = height * width
+    img_shapes = [(1, height, width)] * batch_size
+
+    for step in range(steps):
+        latents = torch.randn((batch_size, seq_len, latent_channels), generator=generator, dtype=torch.float32)
+        prompt_embeds = torch.randn((batch_size, prompt_len, prompt_dim), generator=generator, dtype=torch.float32)
+        noise = torch.randn((batch_size, seq_len, latent_channels), generator=generator, dtype=torch.float32)
+        timesteps = torch.randint(0, 1000, (batch_size,), generator=generator, dtype=torch.long)
+
+        mask = torch.ones((batch_size, prompt_len), dtype=torch.bool)
+        cutoff = prompt_len - 8 - (step % 4)
+        if cutoff > 0:
+            mask[0, cutoff:] = False
+        if batch_size > 1:
+            mask[1, prompt_len - 12 :] = False
+
+        batches.append(
+            {
+                "latents": latents,
+                "prompt_embeds": prompt_embeds,
+                "encoder_hidden_states_mask": mask,
+                "noise": noise,
+                "timesteps": timesteps,
+                "img_shapes": list(img_shapes),
+                "sample_ids": [f"sample-{step}-{index}" for index in range(batch_size)],
+            }
+        )
+    return batches
+
+
+def clone_raw_batches(batches: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return copy.deepcopy(batches)
+
+
+def clone_state_dict(model: torch.nn.Module) -> dict[str, torch.Tensor]:
+    return {name: tensor.detach().cpu().clone() for name, tensor in model.state_dict().items()}
+
+
+def max_state_dict_diff(left: dict[str, torch.Tensor], right: dict[str, torch.Tensor]) -> float:
+    diff = 0.0
+    for key in left:
+        if key not in right:
+            raise KeyError(f"Missing parameter in reference state dict: {key}")
+        diff = max(diff, float((left[key] - right[key]).abs().max().item()))
+    return diff
+
+
+def direct_diffusers_train(
+    *,
+    model_dir: Path,
+    batches: list[dict[str, Any]],
+    device: torch.device,
+    dtype: torch.dtype,
+    learning_rate: float,
+    attention_backend: str,
+) -> dict[str, Any]:
+    model = QwenImageTransformer2DModel.from_pretrained(model_dir, subfolder="transformer")
+    model.to(device=device, dtype=dtype)
+    model.set_attention_backend(attention_backend)
+    model.train()
+
+    scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(model_dir, subfolder="scheduler")
+    scheduler.set_timesteps(scheduler.config.num_train_timesteps)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+
+    losses: list[float] = []
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    started = time.perf_counter()
+
+    for raw_batch in clone_raw_batches(batches):
+        latents = raw_batch["latents"].to(device=device, dtype=dtype)
+        prompt_embeds = raw_batch["prompt_embeds"].to(device=device, dtype=dtype)
+        attention_mask = raw_batch["encoder_hidden_states_mask"].to(device=device)
+        noise = raw_batch["noise"].to(device=device, dtype=dtype)
+        timesteps, step_indices = FlowMatchObjective._resolve_timesteps(
+            raw_batch["timesteps"].to(device=device),
+            scheduler,
+            device,
+        )
+        sigmas = scheduler.sigmas.to(device=device, dtype=dtype)[step_indices]
+        sigmas = sigmas.view(latents.shape[0], *([1] * (latents.ndim - 1)))
+
+        noisy_latents = (1.0 - sigmas) * latents + sigmas * noise
+        target = noise - latents
+
+        optimizer.zero_grad(set_to_none=True)
+        model_pred = model(
+            hidden_states=noisy_latents,
+            encoder_hidden_states=prompt_embeds,
+            encoder_hidden_states_mask=attention_mask,
+            timestep=timesteps,
+            img_shapes=raw_batch["img_shapes"],
+            return_dict=False,
+        )[0]
+        loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+        loss.backward()
+        optimizer.step()
+        losses.append(float(loss.detach().item()))
+
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    duration_s = time.perf_counter() - started
+
+    return {
+        "losses": losses,
+        "duration_s": duration_s,
+        "state_dict": clone_state_dict(model),
+    }
+
+
+def forge_train(
+    *,
+    model_dir: Path,
+    batches: list[dict[str, Any]],
+    device: torch.device,
+    dtype: torch.dtype,
+    learning_rate: float,
+    parallel_config: ParallelConfig,
+    attention_backend: str,
+) -> dict[str, Any]:
+    core = create_core(
+        model_family="qwen_image",
+        model_name_or_path=str(model_dir),
+        parallel_config=parallel_config,
+    )
+    model = core.model_runtime.build_model()
+    core.model_runtime.load_weights(model)
+    model.to(device=device, dtype=dtype)
+    model.set_attention_backend(attention_backend)
+    plan = core.model_runtime.make_parallel_plan(parallel_config)
+    core.parallel_runtime.setup(plan)
+    model = core.parallel_runtime.parallelize_model(model, plan)
+    model.train()
+
+    optimizer = core.parallel_runtime.prepare_optimizer(
+        model,
+        torch.optim.AdamW(model.parameters(), lr=learning_rate),
+    )
+
+    losses: list[float] = []
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    started = time.perf_counter()
+
+    for raw_batch in clone_raw_batches(batches):
+        batch = core.model_runtime.canonicalize_batch(raw_batch)
+        batch = core.parallel_runtime.redistribute_batch(batch, plan)
+        objective_state = core.objective.prepare(batch, core.model_runtime, model)
+        model_inputs = core.model_runtime.prepare_forward_inputs(batch, objective_state)
+        outputs = model(**model_inputs)
+        loss, metrics, _artifacts = core.objective.compute_loss(outputs, batch, objective_state)
+        core.parallel_runtime.backward(loss)
+        core.parallel_runtime.step(optimizer)
+        losses.append(float(metrics["loss"]))
+
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    duration_s = time.perf_counter() - started
+
+    result = {
+        "losses": losses,
+        "duration_s": duration_s,
+    }
+    if not core.parallel_runtime.is_distributed():
+        result["state_dict"] = clone_state_dict(model)
+    return result
+
+
+def run_alignment_check(
+    *,
+    model_dir: Path,
+    steps: int,
+    batch_size: int,
+    height: int,
+    width: int,
+    prompt_len: int,
+    latent_channels: int,
+    prompt_dim: int,
+    seed: int,
+    device: torch.device,
+    attention_backend: str,
+) -> dict[str, Any]:
+    batches = make_raw_batches(
+        steps=steps,
+        batch_size=batch_size,
+        height=height,
+        width=width,
+        prompt_len=prompt_len,
+        latent_channels=latent_channels,
+        prompt_dim=prompt_dim,
+        seed=seed,
+    )
+
+    direct = direct_diffusers_train(
+        model_dir=model_dir,
+        batches=batches,
+        device=device,
+        dtype=torch.float32,
+        learning_rate=1e-4,
+        attention_backend=attention_backend,
+    )
+    forge = forge_train(
+        model_dir=model_dir,
+        batches=batches,
+        device=device,
+        dtype=torch.float32,
+        learning_rate=1e-4,
+        parallel_config=ParallelConfig(
+            backend="torch",
+            dp_mode="none",
+            mixed_precision="fp32",
+        ),
+        attention_backend=attention_backend,
+    )
+
+    loss_diffs = [abs(a - b) for a, b in zip(direct["losses"], forge["losses"], strict=True)]
+    return {
+        "status": "success",
+        "direct_losses": direct["losses"],
+        "forge_losses": forge["losses"],
+        "max_loss_diff": max(loss_diffs) if loss_diffs else 0.0,
+        "max_param_diff": max_state_dict_diff(direct["state_dict"], forge["state_dict"]),
+        "direct_duration_s": direct["duration_s"],
+        "forge_duration_s": forge["duration_s"],
+    }
+
+
+def distributed_sp_worker(
+    rank: int,
+    world_size: int,
+    master_port: int,
+    model_dir: str,
+    steps: int,
+    batch_size: int,
+    height: int,
+    width: int,
+    prompt_len: int,
+    latent_channels: int,
+    prompt_dim: int,
+    seed: int,
+    attention_backend: str,
+    sp_algorithm: str,
+    return_dict,
+) -> None:
+    try:
+        os.environ["MASTER_ADDR"] = "127.0.0.1"
+        os.environ["MASTER_PORT"] = str(master_port)
+        os.environ["RANK"] = str(rank)
+        os.environ["WORLD_SIZE"] = str(world_size)
+        os.environ["LOCAL_RANK"] = str(rank)
+
+        dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+        torch.cuda.set_device(rank)
+        device = torch.device("cuda", rank)
+
+        batches = make_raw_batches(
+            steps=steps,
+            batch_size=batch_size,
+            height=height,
+            width=width,
+            prompt_len=prompt_len,
+            latent_channels=latent_channels,
+            prompt_dim=prompt_dim,
+            seed=seed,
+        )
+        result = forge_train(
+            model_dir=Path(model_dir),
+            batches=batches,
+            device=device,
+            dtype=torch.bfloat16,
+            learning_rate=1e-4,
+            parallel_config=ParallelConfig(
+                backend="torch",
+                dp_mode="none",
+                mixed_precision="bf16",
+                sequence_parallel=SequenceParallelConfig(
+                    mode="native",
+                    algorithm=sp_algorithm,
+                    degree=world_size,
+                    attention_backend=attention_backend,
+                ),
+            ),
+            attention_backend=attention_backend,
+        )
+        if rank == 0:
+            return_dict["status"] = "success"
+            return_dict["duration_s"] = result["duration_s"]
+            return_dict["losses"] = result["losses"]
+    except Exception as error:  # noqa: BLE001
+        if rank == 0:
+            return_dict["status"] = "error"
+            return_dict["error"] = repr(error)
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def run_native_sp(
+    *,
+    model_dir: Path,
+    steps: int,
+    batch_size: int,
+    height: int,
+    width: int,
+    prompt_len: int,
+    latent_channels: int,
+    prompt_dim: int,
+    seed: int,
+    world_size: int,
+    attention_backend: str,
+    sp_algorithm: str,
+) -> dict[str, Any]:
+    manager = mp.Manager()
+    return_dict = manager.dict()
+    master_port = find_free_port()
+    mp.spawn(
+        distributed_sp_worker,
+        args=(
+            world_size,
+            master_port,
+            str(model_dir),
+            steps,
+            batch_size,
+            height,
+            width,
+            prompt_len,
+            latent_channels,
+            prompt_dim,
+            seed,
+            attention_backend,
+            sp_algorithm,
+            return_dict,
+        ),
+        nprocs=world_size,
+        join=True,
+    )
+    return dict(return_dict)
+
+
+def run_benchmark(
+    *,
+    model_dir: Path,
+    steps: int,
+    batch_size: int,
+    height: int,
+    width: int,
+    prompt_len: int,
+    latent_channels: int,
+    prompt_dim: int,
+    seed: int,
+    attention_backend: str,
+    sp_algorithm: str,
+    world_size: int,
+    device: torch.device,
+) -> dict[str, Any]:
+    batches = make_raw_batches(
+        steps=steps,
+        batch_size=batch_size,
+        height=height,
+        width=width,
+        prompt_len=prompt_len,
+        latent_channels=latent_channels,
+        prompt_dim=prompt_dim,
+        seed=seed,
+    )
+    direct = direct_diffusers_train(
+        model_dir=model_dir,
+        batches=batches,
+        device=device,
+        dtype=torch.bfloat16 if device.type == "cuda" else torch.float32,
+        learning_rate=1e-4,
+        attention_backend=attention_backend,
+    )
+    forge_single = forge_train(
+        model_dir=model_dir,
+        batches=batches,
+        device=device,
+        dtype=torch.bfloat16 if device.type == "cuda" else torch.float32,
+        learning_rate=1e-4,
+        parallel_config=ParallelConfig(
+            backend="torch",
+            dp_mode="none",
+            mixed_precision="bf16" if device.type == "cuda" else "fp32",
+        ),
+        attention_backend=attention_backend,
+    )
+    forge_sp = run_native_sp(
+        model_dir=model_dir,
+        steps=steps,
+        batch_size=batch_size,
+        height=height,
+        width=width,
+        prompt_len=prompt_len,
+        latent_channels=latent_channels,
+        prompt_dim=prompt_dim,
+        seed=seed,
+        world_size=world_size,
+        attention_backend=attention_backend,
+        sp_algorithm=sp_algorithm,
+    )
+    summary = {
+        "status": forge_sp.get("status", "error"),
+        "direct_diffusers_single_gpu_s": direct["duration_s"],
+        "forge_single_gpu_s": forge_single["duration_s"],
+        "forge_native_sp_s": forge_sp.get("duration_s"),
+        "forge_native_sp_losses": forge_sp.get("losses"),
+    }
+    if forge_sp.get("duration_s") is not None:
+        summary["speedup_vs_direct"] = direct["duration_s"] / forge_sp["duration_s"]
+        summary["speedup_vs_forge_single"] = forge_single["duration_s"] / forge_sp["duration_s"]
+    if forge_sp.get("status") == "error":
+        summary["error"] = forge_sp.get("error")
+    return summary
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="QwenImage Forge M2 stress smoke/alignment/benchmark script.")
+    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument("--smoke-steps", type=int, default=2)
+    parser.add_argument("--alignment-steps", type=int, default=2)
+    parser.add_argument("--steps", type=int, default=10)
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--height", type=int, default=64)
+    parser.add_argument("--width", type=int, default=64)
+    parser.add_argument("--prompt-len", type=int, default=512)
+    parser.add_argument("--patch-size", type=int, default=2)
+    parser.add_argument("--latent-channels", type=int, default=64)
+    parser.add_argument("--num-layers", type=int, default=12)
+    parser.add_argument("--num-heads", type=int, default=16)
+    parser.add_argument("--head-dim", type=int, default=64)
+    parser.add_argument("--joint-dim", type=int, default=1024)
+    parser.add_argument("--seed", type=int, default=1234)
+    parser.add_argument("--attention-backend", type=str, default="native")
+    parser.add_argument("--sp-algorithm", type=str, default="ulysses")
+    parser.add_argument("--sp-world-size", type=int, default=2)
+    parser.add_argument("--min-free-gb-per-gpu", type=float, default=60.0)
+    args = parser.parse_args()
+
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    patch_area = args.patch_size * args.patch_size
+    if args.latent_channels % patch_area != 0:
+        raise ValueError(
+            f"latent_channels ({args.latent_channels}) must be divisible by patch_size^2 ({patch_area})"
+        )
+    out_channels = args.latent_channels // patch_area
+    model_slug = (
+        f"synthetic_qwen_image_p{args.patch_size}_c{args.latent_channels}"
+        f"_l{args.num_layers}_h{args.num_heads}x{args.head_dim}_j{args.joint_dim}"
+    )
+    model_dir = ensure_qwen_image_checkpoint(
+        args.output_dir / model_slug,
+        patch_size=args.patch_size,
+        latent_channels=args.latent_channels,
+        out_channels=out_channels,
+        num_layers=args.num_layers,
+        num_heads=args.num_heads,
+        head_dim=args.head_dim,
+        joint_dim=args.joint_dim,
+    )
+
+    preflight = run_gpu_preflight(args.sp_world_size, args.min_free_gb_per_gpu)
+    if not torch.cuda.is_available() or torch.cuda.device_count() < 1:
+        raise RuntimeError("This script expects at least one visible CUDA device.")
+
+    device = torch.device("cuda", 0)
+    smoke_summary: dict[str, Any]
+    benchmark_summary: dict[str, Any]
+
+    if preflight["status"] == "success":
+        smoke_summary = run_native_sp(
+            model_dir=model_dir,
+            steps=args.smoke_steps,
+            batch_size=args.batch_size,
+            height=args.height,
+            width=args.width,
+            prompt_len=args.prompt_len,
+            latent_channels=args.latent_channels,
+            prompt_dim=args.joint_dim,
+            seed=args.seed,
+            world_size=args.sp_world_size,
+            attention_backend=args.attention_backend,
+            sp_algorithm=args.sp_algorithm,
+        )
+        benchmark_summary = run_benchmark(
+            model_dir=model_dir,
+            steps=args.steps,
+            batch_size=args.batch_size,
+            height=args.height,
+            width=args.width,
+            prompt_len=args.prompt_len,
+            latent_channels=args.latent_channels,
+            prompt_dim=args.joint_dim,
+            seed=args.seed,
+            attention_backend=args.attention_backend,
+            sp_algorithm=args.sp_algorithm,
+            world_size=args.sp_world_size,
+            device=device,
+        )
+    else:
+        smoke_summary = {
+            "status": "skipped",
+            "error": preflight["error"],
+        }
+        benchmark_summary = {
+            "status": "skipped",
+            "error": smoke_summary["error"],
+        }
+
+    alignment_summary = run_alignment_check(
+        model_dir=model_dir,
+        steps=args.alignment_steps,
+        batch_size=args.batch_size,
+        height=args.height,
+        width=args.width,
+        prompt_len=args.prompt_len,
+        latent_channels=args.latent_channels,
+        prompt_dim=args.joint_dim,
+        seed=args.seed,
+        device=device,
+        attention_backend=args.attention_backend,
+    )
+
+    summary = {
+        "model_dir": str(model_dir),
+        "config": {
+            "smoke_steps": args.smoke_steps,
+            "alignment_steps": args.alignment_steps,
+            "benchmark_steps": args.steps,
+            "batch_size": args.batch_size,
+            "height": args.height,
+            "width": args.width,
+            "prompt_len": args.prompt_len,
+            "patch_size": args.patch_size,
+            "latent_channels": args.latent_channels,
+            "out_channels": out_channels,
+            "num_layers": args.num_layers,
+            "num_heads": args.num_heads,
+            "head_dim": args.head_dim,
+            "joint_dim": args.joint_dim,
+            "attention_backend": args.attention_backend,
+            "sp_algorithm": args.sp_algorithm,
+            "sp_world_size": args.sp_world_size,
+            "min_free_gb_per_gpu": args.min_free_gb_per_gpu,
+            "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+        },
+        "preflight": preflight,
+        "smoke": smoke_summary,
+        "alignment": alignment_summary,
+        "benchmark": benchmark_summary,
+    }
+
+    output_path = args.output_dir / "qwen_image_m2_stress_summary.json"
+    output_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    print(json.dumps(summary, indent=2), flush=True)
+    print(f"summary_written={output_path}", flush=True)
+
+
+if __name__ == "__main__":
+    mp.set_start_method("spawn", force=True)
+    main()

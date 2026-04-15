@@ -38,10 +38,10 @@ class Trainer:
         self.scheduler_factory = scheduler_factory
         self.state = TrainerState()
 
-        self.parallel_runtime.setup()
         self.model = self.model_runtime.build_model()
         self.modules = self.model_runtime.load_weights(self.model)
         self.parallel_plan = self.model_runtime.make_parallel_plan(self.parallel_config)
+        self.parallel_runtime.setup(self.parallel_plan)
         self.model = self.parallel_runtime.parallelize_model(self.model, self.parallel_plan)
 
         self.optimizer = self.parallel_runtime.prepare_optimizer(

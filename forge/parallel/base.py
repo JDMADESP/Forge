@@ -3,14 +3,16 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Any
 
+from forge.parallel.plan import ParallelPlan
+
 
 class ParallelRuntime(ABC):
     @abstractmethod
-    def setup(self) -> None:
+    def setup(self, plan: ParallelPlan | None = None) -> None:
         """Initialize runtime-local distributed state if needed."""
 
     @abstractmethod
-    def parallelize_model(self, model: Any, plan: dict[str, Any]) -> Any:
+    def parallelize_model(self, model: Any, plan: ParallelPlan) -> Any:
         """Wrap and return a trainable model."""
 
     @abstractmethod
@@ -18,7 +20,7 @@ class ParallelRuntime(ABC):
         """Return an optimizer compatible with the wrapped model."""
 
     @abstractmethod
-    def redistribute_batch(self, batch: Any, plan: dict[str, Any]) -> Any:
+    def redistribute_batch(self, batch: Any, plan: ParallelPlan) -> Any:
         """Redistribute a canonical batch according to the internal plan. For SP use"""
 
     @abstractmethod

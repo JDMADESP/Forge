@@ -37,7 +37,6 @@ def parse_args() -> TrainingEngineArgs:
     parser.add_argument("--num_train_epochs", type=int, default=1)
     parser.add_argument("--checkpoint_every_n_steps", type=int, default=5)
     parser.add_argument("--validation_every_n_steps", type=int, default=5)
-    parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--mixed_precision", default="bf16")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume_from_checkpoint", default=None)

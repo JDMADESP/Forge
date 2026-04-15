@@ -19,4 +19,4 @@ class DenoiseBatch:
     image_embeds: torch.Tensor | None = None
     sample_ids: list[str] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
-
+    model_extras: dict[str, Any] = field(default_factory=dict)

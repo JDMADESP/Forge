@@ -15,6 +15,19 @@ class ConditionSchema:
 
 
 @dataclass(frozen=True)
+class NativeSequenceParallelSpec:
+    supported_algorithms: tuple[str, ...]
+    default_algorithm: str
+    required_batch_extras: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class PatchedSequenceParallelSpec:
+    required_batch_extras: tuple[str, ...] = ()
+    patch_entrypoint: str | None = None
+
+
+@dataclass(frozen=True)
 class ArchitectureParallelSpec:
     # what is the wrap basic unit
     wrap_block_classes: tuple[str, ...] = ()
@@ -22,6 +35,8 @@ class ArchitectureParallelSpec:
     # inputs: dimenstion, indicating what dimension to shard on, reserved for future SP
     shardable_inputs: dict[str, int] = field(default_factory=dict)
     replicate_inputs: tuple[str, ...] = ()
+    native_sequence_parallel: NativeSequenceParallelSpec | None = None
+    patched_sequence_parallel: PatchedSequenceParallelSpec | None = None
 
 
 class ModelArchitecture(ABC):
@@ -36,4 +51,3 @@ class ModelArchitecture(ABC):
 
     def remap_state_dict(self, state_dict: dict[str, Any]) -> dict[str, Any]:
         return state_dict
-

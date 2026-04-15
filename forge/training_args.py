@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from forge.parallel.config import ParallelConfig
+from forge.parallel.config import ParallelConfig, SequenceParallelConfig
 
 
 @dataclass
@@ -32,6 +32,10 @@ class TrainingEngineArgs:
         default_factory=lambda: ["a clean OCR-style poster that says FORGE"])
     parallel_backend: str = "torch"
     dp_mode: str = "fsdp1"
+    sequence_parallel_mode: str = "none"
+    sequence_parallel_algorithm: str = "ulysses"
+    sequence_parallel_degree: int = 1
+    attention_backend: str = "native"
 
     def output_path(self) -> Path:
         return Path(self.output_dir)
@@ -41,4 +45,10 @@ class TrainingEngineArgs:
             backend=self.parallel_backend,
             dp_mode=self.dp_mode,
             mixed_precision=self.mixed_precision,
+            sequence_parallel=SequenceParallelConfig(
+                mode=self.sequence_parallel_mode,
+                algorithm=self.sequence_parallel_algorithm,
+                degree=self.sequence_parallel_degree,
+                attention_backend=self.attention_backend,
+            ),
         )

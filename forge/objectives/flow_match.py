@@ -23,6 +23,14 @@ class FlowMatchObjective(TrainingObjective):
             batch.prompt_embeds = batch.prompt_embeds.to(device=device, dtype=dtype)
         if batch.pooled_embeds is not None:
             batch.pooled_embeds = batch.pooled_embeds.to(device=device, dtype=dtype)
+        if batch.attention_mask is not None:
+            batch.attention_mask = self._move_value(batch.attention_mask, device=device, dtype=dtype)
+        if batch.image_embeds is not None:
+            batch.image_embeds = self._move_value(batch.image_embeds, device=device, dtype=dtype)
+        if batch.model_extras:
+            batch.model_extras = {
+                key: self._move_value(value, device=device, dtype=dtype) for key, value in batch.model_extras.items()
+            }
 
         noise = batch.noise
         if noise is None:
@@ -104,3 +112,16 @@ class FlowMatchObjective(TrainingObjective):
             torch.tensor(indices, device=device, dtype=torch.long),
         )
 
+    @staticmethod
+    def _move_value(value: Any, *, device: torch.device, dtype: torch.dtype) -> Any:
+        if isinstance(value, torch.Tensor):
+            if value.is_floating_point() or value.is_complex():
+                return value.to(device=device, dtype=dtype)
+            return value.to(device=device)
+        if isinstance(value, dict):
+            return {key: FlowMatchObjective._move_value(item, device=device, dtype=dtype) for key, item in value.items()}
+        if isinstance(value, list):
+            return [FlowMatchObjective._move_value(item, device=device, dtype=dtype) for item in value]
+        if isinstance(value, tuple):
+            return tuple(FlowMatchObjective._move_value(item, device=device, dtype=dtype) for item in value)
+        return value
