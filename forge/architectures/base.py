@@ -14,6 +14,8 @@ class ConditionSchema:
     forward_arg_map: dict[str, str] = field(default_factory=dict)
 
 
+# Native SP algo supported by diffusers
+# maybe redundant
 @dataclass(frozen=True)
 class NativeSequenceParallelSpec:
     supported_algorithms: tuple[str, ...]
@@ -21,6 +23,7 @@ class NativeSequenceParallelSpec:
     required_batch_extras: tuple[str, ...] = ()
 
 
+# used for models not natively provided with SP algorithms
 @dataclass(frozen=True)
 class PatchedSequenceParallelSpec:
     required_batch_extras: tuple[str, ...] = ()

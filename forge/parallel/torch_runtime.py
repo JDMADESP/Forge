@@ -57,6 +57,7 @@ class TorchParallelRuntime(ParallelRuntime):
         self.optimizer = optimizer
         return optimizer
 
+    # name weird
     def redistribute_batch(self, batch: Any, plan: ParallelPlan) -> Any:
         for extra in plan.required_batch_extras:
             if extra not in getattr(batch, "model_extras", {}):
@@ -155,15 +156,22 @@ class TorchParallelRuntime(ParallelRuntime):
             )
 
         algorithm = str(config["algorithm"])
-        cp_kwargs: dict[str, Any] = {"convert_to_fp32": bool(config.get("convert_to_fp32", True))}
-        if algorithm == "ulysses":
-            cp_kwargs["ulysses_degree"] = degree
-        elif algorithm == "ring":
-            cp_kwargs["ring_degree"] = degree
-        elif algorithm == "ulysses_anything":
-            cp_kwargs["ulysses_degree"] = degree
+        ring_degree = int(config.get("ring_degree", 1))
+        ulysses_degree = int(config.get("ulysses_degree", 1))
+        if ring_degree * ulysses_degree != degree:
+            raise ValueError(
+                "Invalid native sequence-parallel mesh: "
+                f"degree={degree}, ring_degree={ring_degree}, ulysses_degree={ulysses_degree}"
+            )
+
+        cp_kwargs: dict[str, Any] = {
+            "convert_to_fp32": bool(config.get("convert_to_fp32", True)),
+            "ring_degree": ring_degree,
+            "ulysses_degree": ulysses_degree,
+        }
+        if algorithm == "ulysses_anything":
             cp_kwargs["ulysses_anything"] = True
-        else:
+        elif algorithm not in {"ulysses", "ring", "usp"}:
             raise NotImplementedError(f"Unsupported native sequence-parallel algorithm: {algorithm}")
 
         model.set_attention_backend(str(config["attention_backend"]))

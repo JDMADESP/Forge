@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
 
 import torch.nn as nn
-from diffusers.models.transformers.transformer_qwenimage import QwenImageTransformer2DModel
 
 from forge.architectures.base import (
     ArchitectureParallelSpec,
@@ -12,12 +10,14 @@ from forge.architectures.base import (
     ModelArchitecture,
     NativeSequenceParallelSpec,
 )
+from forge.model_cores.qwen_image import QwenImageDiTConfig
+from forge.model_cores.registry import get_model_core
 
 
 @dataclass
 class QwenImageArchitecture(ModelArchitecture):
     model_name_or_path: str
-    transformer_config: dict[str, Any]
+    model_config: QwenImageDiTConfig
 
     def __post_init__(self) -> None:
         self.condition_schema = ConditionSchema(
@@ -40,11 +40,12 @@ class QwenImageArchitecture(ModelArchitecture):
             wrap_block_classes=("QwenImageTransformerBlock",),
             no_shard_modules=("pos_embed", "time_text_embed"),
             native_sequence_parallel=NativeSequenceParallelSpec(
-                supported_algorithms=("ulysses", "ring", "ulysses_anything"),
+                supported_algorithms=("ulysses", "ring", "usp", "ulysses_anything"),
                 default_algorithm="ulysses",
                 required_batch_extras=("encoder_hidden_states_mask", "img_shapes"),
             ),
         )
 
     def build_model(self) -> nn.Module:
-        return QwenImageTransformer2DModel.from_config(self.transformer_config)
+        model_cls = get_model_core("qwen_image")
+        return model_cls(**self.model_config.to_init_kwargs())

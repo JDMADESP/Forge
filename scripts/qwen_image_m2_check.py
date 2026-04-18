@@ -19,6 +19,7 @@ import torch.nn.functional as F
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT_DIR = ROOT / "outputs" / "m2_qwen_image_check"
 VENDORED_DIFFUSERS_SRC = ROOT / "diffusers" / "src"
+TRAIN_LR = 1e-4
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 if VENDORED_DIFFUSERS_SRC.exists():
@@ -39,7 +40,7 @@ from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchE
 
 from forge.core import create_core
 from forge.objectives.flow_match import FlowMatchObjective
-from forge.parallel.config import ParallelConfig, SequenceParallelConfig
+from forge.parallel.config import ParallelConfig, SequenceParallelConfig, resolve_context_parallel_degrees
 
 
 def find_free_port() -> int:
@@ -157,6 +158,44 @@ def run_gpu_preflight(world_size: int, min_free_gb_per_gpu: float) -> dict[str, 
         "visible_gpus": visible_gpus,
         "selected_gpus": selected,
     }
+
+
+def build_sequence_parallel_config(
+    *,
+    sp_algorithm: str,
+    world_size: int,
+    attention_backend: str,
+    usp_ulysses_degree: int | None = None,
+    usp_ring_degree: int | None = None,
+) -> SequenceParallelConfig:
+    sequence_parallel_kwargs: dict[str, Any] = {
+        "mode": "native",
+        "algorithm": sp_algorithm,
+        "degree": world_size,
+        "attention_backend": attention_backend,
+    }
+    if sp_algorithm == "usp":
+        sequence_parallel_kwargs["ulysses_degree"] = usp_ulysses_degree
+        sequence_parallel_kwargs["ring_degree"] = usp_ring_degree
+    return SequenceParallelConfig(**sequence_parallel_kwargs)
+
+
+def summarize_loss_diffs(
+    reference_losses: list[float],
+    candidate_losses: list[float],
+) -> dict[str, Any]:
+    per_step_abs_diff = [abs(reference - candidate) for reference, candidate in zip(reference_losses, candidate_losses, strict=True)]
+    return {
+        "reference_losses": reference_losses,
+        "candidate_losses": candidate_losses,
+        "per_step_abs_diff": per_step_abs_diff,
+        "max_abs_diff": max(per_step_abs_diff) if per_step_abs_diff else 0.0,
+        "mean_abs_diff": (sum(per_step_abs_diff) / len(per_step_abs_diff)) if per_step_abs_diff else 0.0,
+    }
+
+
+def extract_rank_errors(result: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in result.items() if key.startswith("rank_") and key.endswith("_error")}
 
 
 def make_raw_batches(
@@ -371,7 +410,7 @@ def run_alignment_check(
         batches=batches,
         device=device,
         dtype=torch.float32,
-        learning_rate=1e-4,
+        learning_rate=TRAIN_LR,
         attention_backend=attention_backend,
     )
     forge = forge_train(
@@ -379,7 +418,7 @@ def run_alignment_check(
         batches=batches,
         device=device,
         dtype=torch.float32,
-        learning_rate=1e-4,
+        learning_rate=TRAIN_LR,
         parallel_config=ParallelConfig(
             backend="torch",
             dp_mode="none",
@@ -415,6 +454,8 @@ def distributed_sp_worker(
     seed: int,
     attention_backend: str,
     sp_algorithm: str,
+    usp_ulysses_degree: int | None,
+    usp_ring_degree: int | None,
     return_dict,
 ) -> None:
     try:
@@ -443,16 +484,17 @@ def distributed_sp_worker(
             batches=batches,
             device=device,
             dtype=torch.bfloat16,
-            learning_rate=1e-4,
+            learning_rate=TRAIN_LR,
             parallel_config=ParallelConfig(
                 backend="torch",
                 dp_mode="none",
                 mixed_precision="bf16",
-                sequence_parallel=SequenceParallelConfig(
-                    mode="native",
-                    algorithm=sp_algorithm,
-                    degree=world_size,
+                sequence_parallel=build_sequence_parallel_config(
+                    sp_algorithm=sp_algorithm,
+                    world_size=world_size,
                     attention_backend=attention_backend,
+                    usp_ulysses_degree=usp_ulysses_degree,
+                    usp_ring_degree=usp_ring_degree,
                 ),
             ),
             attention_backend=attention_backend,
@@ -462,9 +504,10 @@ def distributed_sp_worker(
             return_dict["duration_s"] = result["duration_s"]
             return_dict["losses"] = result["losses"]
     except Exception as error:  # noqa: BLE001
-        if rank == 0:
+        return_dict[f"rank_{rank}_error"] = repr(error)
+        if "status" not in return_dict:
             return_dict["status"] = "error"
-            return_dict["error"] = repr(error)
+            return_dict["error"] = f"rank_{rank}: {repr(error)}"
     finally:
         if dist.is_initialized():
             dist.destroy_process_group()
@@ -484,6 +527,8 @@ def run_native_sp(
     world_size: int,
     attention_backend: str,
     sp_algorithm: str,
+    usp_ulysses_degree: int | None = None,
+    usp_ring_degree: int | None = None,
 ) -> dict[str, Any]:
     manager = mp.Manager()
     return_dict = manager.dict()
@@ -504,12 +549,106 @@ def run_native_sp(
             seed,
             attention_backend,
             sp_algorithm,
+            usp_ulysses_degree,
+            usp_ring_degree,
             return_dict,
         ),
         nprocs=world_size,
         join=True,
     )
     return dict(return_dict)
+
+
+def run_sp_precision_comparison(
+    *,
+    model_dir: Path,
+    steps: int,
+    batch_size: int,
+    height: int,
+    width: int,
+    prompt_len: int,
+    latent_channels: int,
+    prompt_dim: int,
+    seed: int,
+    attention_backend: str,
+    device: torch.device,
+    sp_algorithm: str,
+    world_size: int,
+    usp_ulysses_degree: int | None = None,
+    usp_ring_degree: int | None = None,
+    baseline_result: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if baseline_result is None:
+        batches = make_raw_batches(
+            steps=steps,
+            batch_size=batch_size,
+            height=height,
+            width=width,
+            prompt_len=prompt_len,
+            latent_channels=latent_channels,
+            prompt_dim=prompt_dim,
+            seed=seed,
+        )
+        baseline = forge_train(
+            model_dir=model_dir,
+            batches=batches,
+            device=device,
+            dtype=torch.bfloat16 if device.type == "cuda" else torch.float32,
+            learning_rate=TRAIN_LR,
+            parallel_config=ParallelConfig(
+                backend="torch",
+                dp_mode="none",
+                mixed_precision="bf16" if device.type == "cuda" else "fp32",
+            ),
+            attention_backend=attention_backend,
+        )
+    else:
+        baseline = baseline_result
+    sp_result = run_native_sp(
+        model_dir=model_dir,
+        steps=steps,
+        batch_size=batch_size,
+        height=height,
+        width=width,
+        prompt_len=prompt_len,
+        latent_channels=latent_channels,
+        prompt_dim=prompt_dim,
+        seed=seed,
+        world_size=world_size,
+        attention_backend=attention_backend,
+        sp_algorithm=sp_algorithm,
+        usp_ulysses_degree=usp_ulysses_degree,
+        usp_ring_degree=usp_ring_degree,
+    )
+
+    resolved_ring_degree, resolved_ulysses_degree = resolve_context_parallel_degrees(
+        algorithm=sp_algorithm,
+        degree=world_size,
+        ulysses_degree=usp_ulysses_degree,
+        ring_degree=usp_ring_degree,
+    )
+    summary = {
+        "status": sp_result.get("status", "error"),
+        "algorithm": sp_algorithm,
+        "world_size": world_size,
+        "ring_degree": resolved_ring_degree,
+        "ulysses_degree": resolved_ulysses_degree,
+        "baseline_duration_s": baseline["duration_s"],
+        "baseline_losses": baseline["losses"],
+        "sp_duration_s": sp_result.get("duration_s"),
+        "sp_losses": sp_result.get("losses"),
+    }
+    if sp_result.get("status") == "success":
+        summary.update(
+            summarize_loss_diffs(
+                baseline["losses"],
+                list(sp_result["losses"]),
+            )
+        )
+    else:
+        summary["error"] = sp_result.get("error")
+        summary.update(extract_rank_errors(sp_result))
+    return summary
 
 
 def run_benchmark(
@@ -527,6 +666,8 @@ def run_benchmark(
     sp_algorithm: str,
     world_size: int,
     device: torch.device,
+    usp_ulysses_degree: int | None = None,
+    usp_ring_degree: int | None = None,
 ) -> dict[str, Any]:
     batches = make_raw_batches(
         steps=steps,
@@ -543,7 +684,7 @@ def run_benchmark(
         batches=batches,
         device=device,
         dtype=torch.bfloat16 if device.type == "cuda" else torch.float32,
-        learning_rate=1e-4,
+        learning_rate=TRAIN_LR,
         attention_backend=attention_backend,
     )
     forge_single = forge_train(
@@ -551,7 +692,7 @@ def run_benchmark(
         batches=batches,
         device=device,
         dtype=torch.bfloat16 if device.type == "cuda" else torch.float32,
-        learning_rate=1e-4,
+        learning_rate=TRAIN_LR,
         parallel_config=ParallelConfig(
             backend="torch",
             dp_mode="none",
@@ -572,6 +713,8 @@ def run_benchmark(
         world_size=world_size,
         attention_backend=attention_backend,
         sp_algorithm=sp_algorithm,
+        usp_ulysses_degree=usp_ulysses_degree,
+        usp_ring_degree=usp_ring_degree,
     )
     summary = {
         "status": forge_sp.get("status", "error"),
@@ -585,6 +728,7 @@ def run_benchmark(
         summary["speedup_vs_forge_single"] = forge_single["duration_s"] / forge_sp["duration_s"]
     if forge_sp.get("status") == "error":
         summary["error"] = forge_sp.get("error")
+        summary.update(extract_rank_errors(forge_sp))
     return summary
 
 
@@ -608,6 +752,11 @@ def main() -> None:
     parser.add_argument("--attention-backend", type=str, default="native")
     parser.add_argument("--sp-algorithm", type=str, default="ulysses")
     parser.add_argument("--sp-world-size", type=int, default=2)
+    parser.add_argument("--usp-ulysses-degree", type=int, default=None)
+    parser.add_argument("--usp-ring-degree", type=int, default=None)
+    parser.add_argument("--compare-sp-precision", action="store_true")
+    parser.add_argument("--ulysses-world-size", type=int, default=4)
+    parser.add_argument("--usp-world-size", type=int, default=4)
     parser.add_argument("--min-free-gb-per-gpu", type=float, default=60.0)
     args = parser.parse_args()
 
@@ -633,13 +782,17 @@ def main() -> None:
         joint_dim=args.joint_dim,
     )
 
-    preflight = run_gpu_preflight(args.sp_world_size, args.min_free_gb_per_gpu)
+    required_world_sizes = [args.sp_world_size]
+    if args.compare_sp_precision:
+        required_world_sizes.extend([args.ulysses_world_size, args.usp_world_size])
+    preflight = run_gpu_preflight(max(required_world_sizes), args.min_free_gb_per_gpu)
     if not torch.cuda.is_available() or torch.cuda.device_count() < 1:
         raise RuntimeError("This script expects at least one visible CUDA device.")
 
     device = torch.device("cuda", 0)
     smoke_summary: dict[str, Any]
     benchmark_summary: dict[str, Any]
+    precision_summary: dict[str, Any]
 
     if preflight["status"] == "success":
         smoke_summary = run_native_sp(
@@ -655,6 +808,8 @@ def main() -> None:
             world_size=args.sp_world_size,
             attention_backend=args.attention_backend,
             sp_algorithm=args.sp_algorithm,
+            usp_ulysses_degree=args.usp_ulysses_degree,
+            usp_ring_degree=args.usp_ring_degree,
         )
         benchmark_summary = run_benchmark(
             model_dir=model_dir,
@@ -670,13 +825,94 @@ def main() -> None:
             sp_algorithm=args.sp_algorithm,
             world_size=args.sp_world_size,
             device=device,
+            usp_ulysses_degree=args.usp_ulysses_degree,
+            usp_ring_degree=args.usp_ring_degree,
         )
+        if args.compare_sp_precision:
+            precision_batches = make_raw_batches(
+                steps=args.steps,
+                batch_size=args.batch_size,
+                height=args.height,
+                width=args.width,
+                prompt_len=args.prompt_len,
+                latent_channels=args.latent_channels,
+                prompt_dim=args.joint_dim,
+                seed=args.seed,
+            )
+            baseline_result = forge_train(
+                model_dir=model_dir,
+                batches=precision_batches,
+                device=device,
+                dtype=torch.bfloat16 if device.type == "cuda" else torch.float32,
+                learning_rate=TRAIN_LR,
+                parallel_config=ParallelConfig(
+                    backend="torch",
+                    dp_mode="none",
+                    mixed_precision="bf16" if device.type == "cuda" else "fp32",
+                ),
+                attention_backend=args.attention_backend,
+            )
+            precision_comparisons = {
+                "ulysses": run_sp_precision_comparison(
+                    model_dir=model_dir,
+                    steps=args.steps,
+                    batch_size=args.batch_size,
+                    height=args.height,
+                    width=args.width,
+                    prompt_len=args.prompt_len,
+                    latent_channels=args.latent_channels,
+                    prompt_dim=args.joint_dim,
+                    seed=args.seed,
+                    attention_backend=args.attention_backend,
+                    device=device,
+                    sp_algorithm="ulysses",
+                    world_size=args.ulysses_world_size,
+                    baseline_result=baseline_result,
+                ),
+                "usp": run_sp_precision_comparison(
+                    model_dir=model_dir,
+                    steps=args.steps,
+                    batch_size=args.batch_size,
+                    height=args.height,
+                    width=args.width,
+                    prompt_len=args.prompt_len,
+                    latent_channels=args.latent_channels,
+                    prompt_dim=args.joint_dim,
+                    seed=args.seed,
+                    attention_backend=args.attention_backend,
+                    device=device,
+                    sp_algorithm="usp",
+                    world_size=args.usp_world_size,
+                    usp_ulysses_degree=args.usp_ulysses_degree,
+                    usp_ring_degree=args.usp_ring_degree,
+                    baseline_result=baseline_result,
+                ),
+            }
+            statuses = {name: result["status"] for name, result in precision_comparisons.items()}
+            precision_summary = {
+                "status": "success" if all(status == "success" for status in statuses.values()) else "error",
+                "reference": {
+                    "mode": "forge_single_gpu",
+                    "duration_s": baseline_result["duration_s"],
+                    "losses": baseline_result["losses"],
+                },
+                "comparisons": precision_comparisons,
+            }
+        else:
+            precision_summary = {
+                "status": "skipped",
+                "error": "compare_sp_precision is disabled.",
+            }
     else:
         smoke_summary = {
             "status": "skipped",
             "error": preflight["error"],
         }
         benchmark_summary = {
+            "status": "skipped",
+            "error": smoke_summary["error"],
+        }
+        precision_summary = {
             "status": "skipped",
             "error": smoke_summary["error"],
         }
@@ -715,6 +951,11 @@ def main() -> None:
             "attention_backend": args.attention_backend,
             "sp_algorithm": args.sp_algorithm,
             "sp_world_size": args.sp_world_size,
+            "usp_ulysses_degree": args.usp_ulysses_degree,
+            "usp_ring_degree": args.usp_ring_degree,
+            "compare_sp_precision": args.compare_sp_precision,
+            "ulysses_world_size": args.ulysses_world_size,
+            "usp_world_size": args.usp_world_size,
             "min_free_gb_per_gpu": args.min_free_gb_per_gpu,
             "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
         },
@@ -722,6 +963,7 @@ def main() -> None:
         "smoke": smoke_summary,
         "alignment": alignment_summary,
         "benchmark": benchmark_summary,
+        "sp_precision": precision_summary,
     }
 
     output_path = args.output_dir / "qwen_image_m2_stress_summary.json"
