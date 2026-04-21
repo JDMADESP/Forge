@@ -6,7 +6,6 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
-from diffusers.models._modeling_parallel import ContextParallelConfig
 from torch.distributed.checkpoint import load as dcp_load
 from torch.distributed.checkpoint import save as dcp_save
 from torch.distributed.checkpoint.state_dict import (
@@ -29,6 +28,7 @@ class TorchParallelRuntime(ParallelRuntime):
         self.model: Any | None = None
         self.optimizer: Any | None = None
         self.use_fsdp = False
+        self.sequence_parallel_group: dist.ProcessGroup | None = None
 
     def setup(self, plan: ParallelPlan | None = None) -> None:
         del plan
@@ -37,6 +37,9 @@ class TorchParallelRuntime(ParallelRuntime):
     def parallelize_model(self, model: Any, plan: ParallelPlan) -> Any:
         if plan.parameter_degree > 1 and plan.sequence_degree > 1:
             raise NotImplementedError("Combined FSDP + sequence parallel is not implemented yet.")
+
+        self.use_fsdp = False
+        self.sequence_parallel_group = None
 
         device = self._get_device()
         model.to(device)
@@ -57,7 +60,6 @@ class TorchParallelRuntime(ParallelRuntime):
         self.optimizer = optimizer
         return optimizer
 
-    # name weird
     def redistribute_batch(self, batch: Any, plan: ParallelPlan) -> Any:
         for extra in plan.required_batch_extras:
             if extra not in getattr(batch, "model_extras", {}):
@@ -68,6 +70,7 @@ class TorchParallelRuntime(ParallelRuntime):
         loss.backward()
 
     def step(self, optimizer: Any, scheduler: Any | None = None) -> None:
+        self._sync_sequence_parallel_gradients(optimizer)
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
         if scheduler is not None:
@@ -146,7 +149,7 @@ class TorchParallelRuntime(ParallelRuntime):
 
     def _apply_native_sequence_parallel(self, model: Any, strategy: StrategySpec) -> None:
         if not self.is_distributed():
-            raise RuntimeError("torch.distributed must be initialized before enabling native sequence parallelism.")
+            raise RuntimeError("torch.distributed must be initialized before enabling Ulysses sequence parallelism.")
 
         config = strategy.config
         degree = int(config["degree"])
@@ -156,26 +159,16 @@ class TorchParallelRuntime(ParallelRuntime):
             )
 
         algorithm = str(config["algorithm"])
-        ring_degree = int(config.get("ring_degree", 1))
-        ulysses_degree = int(config.get("ulysses_degree", 1))
-        if ring_degree * ulysses_degree != degree:
-            raise ValueError(
-                "Invalid native sequence-parallel mesh: "
-                f"degree={degree}, ring_degree={ring_degree}, ulysses_degree={ulysses_degree}"
+        if algorithm != "ulysses":
+            raise NotImplementedError(
+                f"Unsupported native sequence-parallel algorithm: {algorithm}. Forge currently only supports ulysses."
             )
 
-        cp_kwargs: dict[str, Any] = {
-            "convert_to_fp32": bool(config.get("convert_to_fp32", True)),
-            "ring_degree": ring_degree,
-            "ulysses_degree": ulysses_degree,
-        }
-        if algorithm == "ulysses_anything":
-            cp_kwargs["ulysses_anything"] = True
-        elif algorithm not in {"ulysses", "ring", "usp"}:
-            raise NotImplementedError(f"Unsupported native sequence-parallel algorithm: {algorithm}")
-
         model.set_attention_backend(str(config["attention_backend"]))
-        model.enable_parallelism(config=ContextParallelConfig(**cp_kwargs))
+        if not hasattr(model, "enable_ulysses_parallelism"):
+            raise TypeError(f"Model {type(model).__name__} does not implement enable_ulysses_parallelism().")
+        model.enable_ulysses_parallelism(degree=degree)
+        self.sequence_parallel_group = dist.group.WORLD
 
     def _apply_fsdp(self, model: Any, strategy: StrategySpec, device: torch.device) -> Any:
         world_size = dist.get_world_size() if self.is_distributed() else 1
@@ -196,6 +189,19 @@ class TorchParallelRuntime(ParallelRuntime):
             sharding_strategy=ShardingStrategy.FULL_SHARD,
             sync_module_states=True,
         )
+
+    def _sync_sequence_parallel_gradients(self, optimizer: Any) -> None:
+        if self.sequence_parallel_group is None or self.use_fsdp or not self.is_distributed():
+            return
+
+        for param_group in optimizer.param_groups:
+            for param in param_group["params"]:
+                grad = getattr(param, "grad", None)
+                if grad is None:
+                    continue
+                if grad.is_sparse:
+                    raise NotImplementedError("Sparse gradients are not supported with self-owned Ulysses yet.")
+                dist.all_reduce(grad, op=dist.ReduceOp.SUM, group=self.sequence_parallel_group)
 
     def _build_mixed_precision(self) -> Any:
         if self.mixed_precision == "bf16":

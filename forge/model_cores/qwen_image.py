@@ -5,12 +5,13 @@ from dataclasses import dataclass
 from math import prod
 from typing import Any
 
+import torch.distributed as dist
+
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.configuration_utils import ConfigMixin, register_to_config
-from diffusers.models._modeling_parallel import ContextParallelInput, ContextParallelOutput
 from diffusers.models.attention import AttentionMixin, FeedForward
 from diffusers.models.attention_dispatch import dispatch_attention_fn
 from diffusers.models.attention_processor import Attention
@@ -22,6 +23,14 @@ from diffusers.utils import apply_lora_scale, deprecate, logging
 from diffusers.utils.torch_utils import lru_cache_unless_export, maybe_allow_in_graph
 
 from forge.model_cores.base_dit import BaseDiT
+from forge.parallel.ulysses import (
+    UlyssesParallelContext,
+    build_ulysses_context,
+    gather_tensor,
+    shard_tensor,
+    ulysses_heads_to_sequence,
+    ulysses_sequence_to_heads,
+)
 from forge.model_cores.registry import register_model_core
 
 try:
@@ -121,6 +130,45 @@ def compute_text_seq_len_from_mask(
         torch.as_tensor(text_seq_len, device=encoder_hidden_states.device),
     )
     return text_seq_len, per_sample_len, encoder_hidden_states_mask
+
+
+def run_ulysses_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    attn_mask: torch.Tensor | None,
+    dropout_p: float,
+    is_causal: bool,
+    scale: float | None,
+    backend: Any,
+    context: UlyssesParallelContext,
+) -> torch.Tensor:
+    query = ulysses_heads_to_sequence(query, context=context)
+    key = ulysses_heads_to_sequence(key, context=context)
+    value = ulysses_heads_to_sequence(value, context=context)
+    output = dispatch_attention_fn(
+        query,
+        key,
+        value,
+        attn_mask=attn_mask,
+        dropout_p=dropout_p,
+        is_causal=is_causal,
+        scale=scale,
+        backend=backend,
+    )
+    return ulysses_sequence_to_heads(output, context=context)
+
+
+def shard_rotary_embeddings(
+    image_rotary_emb: tuple[torch.Tensor, torch.Tensor],
+    ulysses_context: UlyssesParallelContext,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    img_freqs, txt_freqs = image_rotary_emb
+    return (
+        shard_tensor(img_freqs, dim=0, context=ulysses_context),
+        shard_tensor(txt_freqs, dim=0, context=ulysses_context),
+    )
 
 
 class QwenTimestepProjEmbeddings(nn.Module):
@@ -379,11 +427,14 @@ class QwenEmbedLayer3DRope(nn.Module):
 
 class QwenDoubleStreamAttnProcessor2_0:
     _attention_backend = None
-    _parallel_config = None
+    _ulysses_context: UlyssesParallelContext | None = None
 
     def __init__(self) -> None:
         if not hasattr(F, "scaled_dot_product_attention"):
             raise ImportError("QwenDoubleStreamAttnProcessor2_0 requires PyTorch 2.0 or later.")
+
+    def set_ulysses_context(self, context: UlyssesParallelContext | None) -> None:
+        self._ulysses_context = context
 
     def __call__(
         self,
@@ -429,16 +480,31 @@ class QwenDoubleStreamAttnProcessor2_0:
             txt_query = apply_rotary_emb_qwen(txt_query, txt_freqs, use_real=False)
             txt_key = apply_rotary_emb_qwen(txt_key, txt_freqs, use_real=False)
 
-        joint_hidden_states = dispatch_attention_fn(
-            torch.cat([txt_query, img_query], dim=1),
-            torch.cat([txt_key, img_key], dim=1),
-            torch.cat([txt_value, img_value], dim=1),
-            attn_mask=attention_mask,
-            dropout_p=0.0,
-            is_causal=False,
-            backend=self._attention_backend,
-            parallel_config=self._parallel_config,
-        )
+        joint_query = torch.cat([txt_query, img_query], dim=1)
+        joint_key = torch.cat([txt_key, img_key], dim=1)
+        joint_value = torch.cat([txt_value, img_value], dim=1)
+        if self._ulysses_context is not None and self._ulysses_context.degree > 1:
+            joint_hidden_states = run_ulysses_attention(
+                joint_query,
+                joint_key,
+                joint_value,
+                attn_mask=attention_mask,
+                dropout_p=0.0,
+                is_causal=False,
+                scale=None,
+                backend=self._attention_backend,
+                context=self._ulysses_context,
+            )
+        else:
+            joint_hidden_states = dispatch_attention_fn(
+                joint_query,
+                joint_key,
+                joint_value,
+                attn_mask=attention_mask,
+                dropout_p=0.0,
+                is_causal=False,
+                backend=self._attention_backend,
+            )
         joint_hidden_states = joint_hidden_states.flatten(2, 3).to(dtype=img_query.dtype)
 
         txt_attn_output = joint_hidden_states[:, :seq_txt, :]
@@ -556,20 +622,6 @@ class QwenImageDiT(BaseDiT, ConfigMixin, PeftAdapterMixin, FromOriginalModelMixi
     _no_split_modules = ["QwenImageTransformerBlock"]
     _skip_layerwise_casting_patterns = ["pos_embed", "norm"]
     _repeated_blocks = ["QwenImageTransformerBlock"]
-    _cp_plan = {
-        "transformer_blocks.0": {
-            "hidden_states": ContextParallelInput(split_dim=1, expected_dims=3, split_output=False),
-            "encoder_hidden_states": ContextParallelInput(split_dim=1, expected_dims=3, split_output=False),
-        },
-        "transformer_blocks.*": {
-            "modulate_index": ContextParallelInput(split_dim=1, expected_dims=2, split_output=False),
-        },
-        "pos_embed": {
-            0: ContextParallelInput(split_dim=0, expected_dims=2, split_output=True),
-            1: ContextParallelInput(split_dim=0, expected_dims=2, split_output=True),
-        },
-        "proj_out": ContextParallelOutput(gather_dim=1, expected_dims=3),
-    }
 
     @register_to_config
     def __init__(
@@ -618,6 +670,26 @@ class QwenImageDiT(BaseDiT, ConfigMixin, PeftAdapterMixin, FromOriginalModelMixi
         self.proj_out = nn.Linear(self.inner_dim, patch_size * patch_size * self.out_channels, bias=True)
         self.gradient_checkpointing = False
         self.zero_cond_t = zero_cond_t
+        self._ulysses_context: UlyssesParallelContext | None = None
+
+    def enable_ulysses_parallelism(self, *, degree: int, group: dist.ProcessGroup | None = None) -> None:
+        context = build_ulysses_context(degree=degree, group=group)
+        self._ulysses_context = context
+        for module in self.modules():
+            if not isinstance(module, Attention):
+                continue
+            processor = module.processor
+            if processor is not None and hasattr(processor, "set_ulysses_context"):
+                processor.set_ulysses_context(context)
+
+    def disable_ulysses_parallelism(self) -> None:
+        self._ulysses_context = None
+        for module in self.modules():
+            if not isinstance(module, Attention):
+                continue
+            processor = module.processor
+            if processor is not None and hasattr(processor, "set_ulysses_context"):
+                processor.set_ulysses_context(None)
 
     @apply_lora_scale("attention_kwargs")
     def forward(
@@ -650,6 +722,7 @@ class QwenImageDiT(BaseDiT, ConfigMixin, PeftAdapterMixin, FromOriginalModelMixi
                 standard_warn=False,
             )
 
+        ulysses_context = self._ulysses_context
         hidden_states = self.img_in(hidden_states)
         timestep = timestep.to(hidden_states.dtype)
         if self.zero_cond_t:
@@ -685,6 +758,15 @@ class QwenImageDiT(BaseDiT, ConfigMixin, PeftAdapterMixin, FromOriginalModelMixi
                 :, None, None, :
             ]
 
+        if ulysses_context is not None and ulysses_context.degree > 1:
+            if controlnet_block_samples is not None:
+                raise NotImplementedError("ControlNet block samples are not supported with self-owned Ulysses yet.")
+            hidden_states = shard_tensor(hidden_states, dim=1, context=ulysses_context)
+            encoder_hidden_states = shard_tensor(encoder_hidden_states, dim=1, context=ulysses_context)
+            image_rotary_emb = shard_rotary_embeddings(image_rotary_emb, ulysses_context)
+            if modulate_index is not None:
+                modulate_index = shard_tensor(modulate_index, dim=1, context=ulysses_context)
+
         for index_block, block in enumerate(self.transformer_blocks):
             if torch.is_grad_enabled() and self.gradient_checkpointing:
                 encoder_hidden_states, hidden_states = self._gradient_checkpointing_func(
@@ -715,6 +797,8 @@ class QwenImageDiT(BaseDiT, ConfigMixin, PeftAdapterMixin, FromOriginalModelMixi
         if self.zero_cond_t:
             temb = temb.chunk(2, dim=0)[0]
         output = self.proj_out(self.norm_out(hidden_states, temb))
+        if ulysses_context is not None and ulysses_context.degree > 1:
+            output = gather_tensor(output, dim=1, context=ulysses_context)
         if not return_dict:
             return (output,)
         return Transformer2DModelOutput(sample=output)

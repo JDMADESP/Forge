@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import importlib.util
 from typing import Any
 
 import torch
@@ -127,29 +126,15 @@ class QwenImageRuntime(ModelRuntime):
                 raise ValueError("QwenImage architecture does not declare native sequence parallel support.")
             if sequence_parallel.degree > 1:
                 algorithm = (sequence_parallel.algorithm or native_spec.default_algorithm).lower()
-                if sequence_parallel.ulysses_anything and algorithm == "ulysses":
-                    algorithm = "ulysses_anything"
                 if algorithm not in native_spec.supported_algorithms:
                     raise ValueError(
                         f"Unsupported native sequence-parallel algorithm '{algorithm}'. "
                         f"Supported: {native_spec.supported_algorithms}"
                     )
-                ring_degree, ulysses_degree = resolve_context_parallel_degrees(
+                _, ulysses_degree = resolve_context_parallel_degrees(
                     algorithm=algorithm,
                     degree=sequence_parallel.degree,
-                    ulysses_anything=sequence_parallel.ulysses_anything,
-                    ulysses_degree=sequence_parallel.ulysses_degree,
-                    ring_degree=sequence_parallel.ring_degree,
                 )
-                attention_backend = sequence_parallel.attention_backend
-                # Unified / ring attention needs an attention kernel that can return LSE.
-                # Prefer the in-tree cuDNN SDPA path when the torch build exposes it; otherwise
-                # fall back to flash-attn if it is installed.
-                if ring_degree > 1 and attention_backend == "native":
-                    if hasattr(torch.ops.aten, "_scaled_dot_product_cudnn_attention"):
-                        attention_backend = "_native_cudnn"
-                    elif importlib.util.find_spec("flash_attn") is not None:
-                        attention_backend = "flash"
                 strategies.insert(
                     0,
                     StrategySpec(
@@ -157,11 +142,8 @@ class QwenImageRuntime(ModelRuntime):
                         config={
                             "degree": sequence_parallel.degree,
                             "algorithm": algorithm,
-                            "ring_degree": ring_degree,
                             "ulysses_degree": ulysses_degree,
-                            "attention_backend": attention_backend,
-                            "convert_to_fp32": sequence_parallel.convert_to_fp32,
-                            "ulysses_anything": sequence_parallel.ulysses_anything or algorithm == "ulysses_anything",
+                            "attention_backend": sequence_parallel.attention_backend,
                         },
                     ),
                 )

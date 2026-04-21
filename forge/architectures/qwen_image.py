@@ -40,7 +40,7 @@ class QwenImageArchitecture(ModelArchitecture):
             wrap_block_classes=("QwenImageTransformerBlock",),
             no_shard_modules=("pos_embed", "time_text_embed"),
             native_sequence_parallel=NativeSequenceParallelSpec(
-                supported_algorithms=("ulysses", "ring", "usp", "ulysses_anything"),
+                supported_algorithms=("ulysses",),
                 default_algorithm="ulysses",
                 required_batch_extras=("encoder_hidden_states_mask", "img_shapes"),
             ),

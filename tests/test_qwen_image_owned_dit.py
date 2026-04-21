@@ -35,6 +35,7 @@ class QwenImageOwnedDiTTest(unittest.TestCase):
         )
         model = architecture.build_model()
         self.assertIsInstance(model, QwenImageDiT)
+        self.assertEqual(architecture.parallel_spec.native_sequence_parallel.supported_algorithms, ("ulysses",))
 
     def test_qwen_image_checkpoint_adapter_builds_owned_config(self) -> None:
         adapter = QwenImageCheckpointAdapter()

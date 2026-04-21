@@ -165,19 +165,15 @@ def build_sequence_parallel_config(
     sp_algorithm: str,
     world_size: int,
     attention_backend: str,
-    usp_ulysses_degree: int | None = None,
-    usp_ring_degree: int | None = None,
 ) -> SequenceParallelConfig:
-    sequence_parallel_kwargs: dict[str, Any] = {
-        "mode": "native",
-        "algorithm": sp_algorithm,
-        "degree": world_size,
-        "attention_backend": attention_backend,
-    }
-    if sp_algorithm == "usp":
-        sequence_parallel_kwargs["ulysses_degree"] = usp_ulysses_degree
-        sequence_parallel_kwargs["ring_degree"] = usp_ring_degree
-    return SequenceParallelConfig(**sequence_parallel_kwargs)
+    if sp_algorithm != "ulysses":
+        raise ValueError(f"Unsupported SP algorithm: {sp_algorithm}. This script only validates self-owned ulysses.")
+    return SequenceParallelConfig(
+        mode="native",
+        algorithm="ulysses",
+        degree=world_size,
+        attention_backend=attention_backend,
+    )
 
 
 def summarize_loss_diffs(
@@ -454,8 +450,6 @@ def distributed_sp_worker(
     seed: int,
     attention_backend: str,
     sp_algorithm: str,
-    usp_ulysses_degree: int | None,
-    usp_ring_degree: int | None,
     return_dict,
 ) -> None:
     try:
@@ -493,8 +487,6 @@ def distributed_sp_worker(
                     sp_algorithm=sp_algorithm,
                     world_size=world_size,
                     attention_backend=attention_backend,
-                    usp_ulysses_degree=usp_ulysses_degree,
-                    usp_ring_degree=usp_ring_degree,
                 ),
             ),
             attention_backend=attention_backend,
@@ -527,8 +519,6 @@ def run_native_sp(
     world_size: int,
     attention_backend: str,
     sp_algorithm: str,
-    usp_ulysses_degree: int | None = None,
-    usp_ring_degree: int | None = None,
 ) -> dict[str, Any]:
     manager = mp.Manager()
     return_dict = manager.dict()
@@ -549,8 +539,6 @@ def run_native_sp(
             seed,
             attention_backend,
             sp_algorithm,
-            usp_ulysses_degree,
-            usp_ring_degree,
             return_dict,
         ),
         nprocs=world_size,
@@ -574,8 +562,6 @@ def run_sp_precision_comparison(
     device: torch.device,
     sp_algorithm: str,
     world_size: int,
-    usp_ulysses_degree: int | None = None,
-    usp_ring_degree: int | None = None,
     baseline_result: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if baseline_result is None:
@@ -617,21 +603,16 @@ def run_sp_precision_comparison(
         world_size=world_size,
         attention_backend=attention_backend,
         sp_algorithm=sp_algorithm,
-        usp_ulysses_degree=usp_ulysses_degree,
-        usp_ring_degree=usp_ring_degree,
     )
 
-    resolved_ring_degree, resolved_ulysses_degree = resolve_context_parallel_degrees(
+    _, resolved_ulysses_degree = resolve_context_parallel_degrees(
         algorithm=sp_algorithm,
         degree=world_size,
-        ulysses_degree=usp_ulysses_degree,
-        ring_degree=usp_ring_degree,
     )
     summary = {
         "status": sp_result.get("status", "error"),
         "algorithm": sp_algorithm,
         "world_size": world_size,
-        "ring_degree": resolved_ring_degree,
         "ulysses_degree": resolved_ulysses_degree,
         "baseline_duration_s": baseline["duration_s"],
         "baseline_losses": baseline["losses"],
@@ -666,8 +647,6 @@ def run_benchmark(
     sp_algorithm: str,
     world_size: int,
     device: torch.device,
-    usp_ulysses_degree: int | None = None,
-    usp_ring_degree: int | None = None,
 ) -> dict[str, Any]:
     batches = make_raw_batches(
         steps=steps,
@@ -713,8 +692,6 @@ def run_benchmark(
         world_size=world_size,
         attention_backend=attention_backend,
         sp_algorithm=sp_algorithm,
-        usp_ulysses_degree=usp_ulysses_degree,
-        usp_ring_degree=usp_ring_degree,
     )
     summary = {
         "status": forge_sp.get("status", "error"),
@@ -752,11 +729,8 @@ def main() -> None:
     parser.add_argument("--attention-backend", type=str, default="native")
     parser.add_argument("--sp-algorithm", type=str, default="ulysses")
     parser.add_argument("--sp-world-size", type=int, default=2)
-    parser.add_argument("--usp-ulysses-degree", type=int, default=None)
-    parser.add_argument("--usp-ring-degree", type=int, default=None)
     parser.add_argument("--compare-sp-precision", action="store_true")
     parser.add_argument("--ulysses-world-size", type=int, default=4)
-    parser.add_argument("--usp-world-size", type=int, default=4)
     parser.add_argument("--min-free-gb-per-gpu", type=float, default=60.0)
     args = parser.parse_args()
 
@@ -784,7 +758,7 @@ def main() -> None:
 
     required_world_sizes = [args.sp_world_size]
     if args.compare_sp_precision:
-        required_world_sizes.extend([args.ulysses_world_size, args.usp_world_size])
+        required_world_sizes.append(args.ulysses_world_size)
     preflight = run_gpu_preflight(max(required_world_sizes), args.min_free_gb_per_gpu)
     if not torch.cuda.is_available() or torch.cuda.device_count() < 1:
         raise RuntimeError("This script expects at least one visible CUDA device.")
@@ -808,8 +782,6 @@ def main() -> None:
             world_size=args.sp_world_size,
             attention_backend=args.attention_backend,
             sp_algorithm=args.sp_algorithm,
-            usp_ulysses_degree=args.usp_ulysses_degree,
-            usp_ring_degree=args.usp_ring_degree,
         )
         benchmark_summary = run_benchmark(
             model_dir=model_dir,
@@ -825,8 +797,6 @@ def main() -> None:
             sp_algorithm=args.sp_algorithm,
             world_size=args.sp_world_size,
             device=device,
-            usp_ulysses_degree=args.usp_ulysses_degree,
-            usp_ring_degree=args.usp_ring_degree,
         )
         if args.compare_sp_precision:
             precision_batches = make_raw_batches(
@@ -867,24 +837,6 @@ def main() -> None:
                     device=device,
                     sp_algorithm="ulysses",
                     world_size=args.ulysses_world_size,
-                    baseline_result=baseline_result,
-                ),
-                "usp": run_sp_precision_comparison(
-                    model_dir=model_dir,
-                    steps=args.steps,
-                    batch_size=args.batch_size,
-                    height=args.height,
-                    width=args.width,
-                    prompt_len=args.prompt_len,
-                    latent_channels=args.latent_channels,
-                    prompt_dim=args.joint_dim,
-                    seed=args.seed,
-                    attention_backend=args.attention_backend,
-                    device=device,
-                    sp_algorithm="usp",
-                    world_size=args.usp_world_size,
-                    usp_ulysses_degree=args.usp_ulysses_degree,
-                    usp_ring_degree=args.usp_ring_degree,
                     baseline_result=baseline_result,
                 ),
             }
@@ -951,11 +903,8 @@ def main() -> None:
             "attention_backend": args.attention_backend,
             "sp_algorithm": args.sp_algorithm,
             "sp_world_size": args.sp_world_size,
-            "usp_ulysses_degree": args.usp_ulysses_degree,
-            "usp_ring_degree": args.usp_ring_degree,
             "compare_sp_precision": args.compare_sp_precision,
             "ulysses_world_size": args.ulysses_world_size,
-            "usp_world_size": args.usp_world_size,
             "min_free_gb_per_gpu": args.min_free_gb_per_gpu,
             "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
         },
