@@ -1,0 +1,9 @@
+torch
+torchvision
+pillow
+transformers
+accelerate
+sentencepiece
+safetensors
+huggingface_hub
+git+https://github.com/huggingface/diffusers

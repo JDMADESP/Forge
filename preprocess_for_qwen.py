@@ -9,26 +9,37 @@ class QwenImagePreProcessor:
         tokenizer,
         text_encoder,
         device : str = "cuda",
-        dtype
+        dtype :  torch.dtype = torch.bfloat16,
     ):
-    self.vae = vae.to(device)
-    self.tokenizer = tokenizer
-    self.text_encoder = text_encoder
-    self.device = device
-    self.dtype = dtype
+        self.vae = vae.to(device)
+        self.tokenizer = tokenizer
+        self.text_encoder = text_encoder.to(device)
+        self.device = device
+        self.dtype = dtype
 
-    # place models into evaluation mode
-    self.vae.eval()
-    self.text_encoder.eval()
+        # place models into evaluation mode
+        self.vae.eval()
+        self.text_encoder.eval()
 
     @torch.no_grad()
     def preprocess_batch(self, batch):
         pixel_values = batch["pixel_values"].to(self.device, dtype=self.dtype)
         prompts = batch["prompts"]
+        if pixel_values.ndim == 4:
+            pixel_values = pixel_values.unsqueeze(2)
 
         # first need to encode images into latent vectors
         latent_dist = self.vae.encode(pixel_values).latent_dist # encoded output of image as probability distribution
         latents = latent_dist.sample()
+
+        if hasattr(self.vae, "config") and hasattr(self.vae.config, "scaling_factor"):
+            latents = latents * self.vae.config.scaling_factor
+
+        if latents.ndim == 5:
+            if latents.shape[2] == 1:
+                latents = latents.squeeze(2)
+        elif latents.shape[1] == 1:
+            latents = latents.squeeze(1)
 
         # now need to tokenize prompt
         tokenized = self.tokenizer(prompts, padding=True, truncation=True, return_tensors="pt")

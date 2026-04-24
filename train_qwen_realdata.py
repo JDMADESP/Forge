@@ -3,18 +3,18 @@ from __future__ import annotations
 import argparse
 import os
 import random
+from functools import partial
 
 import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
-from functools import partial
 
-from diffusers import AutoencoderKL
+from huggingface_hub import snapshot_download
+from diffusers import AutoencoderKLQwenImage
 from transformers import AutoTokenizer, AutoModel
 
 from forge.core import create_core
-from forge.data import LatentFixtureDataset, collate_latent_fixtures
 from forge.trainer import Trainer
 from forge.training_args import TrainingEngineArgs
 
@@ -35,7 +35,6 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="M2 Qwen Training")
     parser.add_argument("--model_name_or_path", required=True)
     parser.add_argument("--output_dir", default="outputs/qwen_realdata")
-    parser.add_argument("--train_fixture_dir", required=True)
     parser.add_argument("--train_batch_size", type=int, default=1)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--learning_rate", type=float, default=1e-5)
@@ -47,19 +46,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mixed_precision", default="bf16")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume_from_checkpoint", default=None)
+    parser.add_argument("--dataloader_num_workers", type=int, default=0)
 
-    # data preprocessing args
     parser.add_argument("--train_data_dir", required=True)
     parser.add_argument("--image_size", type=int, default=1024)
     parser.add_argument("--image_folder", default="images")
     parser.add_argument("--metadata_file", default="metadata.jsonl")
-    parser.add_argument("--vae_name_or_path", default=None)
-    parser.add_argument("--tokenizer_name_or_path", default=None)
-    parser.add_argument("--text_encoder_name_or_path", default=None)
 
     return parser.parse_args()
 
-def args_to_training_engine(cli_args : argparse.Namespace) -> TrainingEngineArgs:
+def args_to_training_engine(cli_args: argparse.Namespace) -> TrainingEngineArgs:
     return TrainingEngineArgs(
         model_name_or_path=cli_args.model_name_or_path,
         model_family="qwen_image",
@@ -74,6 +70,7 @@ def args_to_training_engine(cli_args : argparse.Namespace) -> TrainingEngineArgs
         validation_every_n_steps=cli_args.validation_every_n_steps,
         mixed_precision=cli_args.mixed_precision,
         seed=cli_args.seed,
+        dataloader_num_workers=cli_args.dataloader_num_workers,
         resume_from_checkpoint=cli_args.resume_from_checkpoint,
     )
 
@@ -99,20 +96,23 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-def build_upstream_modules(model_name_or_path : str, 
-                           vae_name_or_path : str | None, 
-                           tokenizer_name_or_path : str | None, 
-                           text_encoder_name_or_path : str | None, 
-                           device : str, 
-                           dtype : torch.dtype
-    ):
-    vae_source = vae_name_or_path or model_name_or_path
-    tokenizer_source = tokenizer_name_or_path or model_name_or_path
-    text_encoder_source = text_encoder_name_or_path or model_name_or_path
+def build_upstream_modules(
+    model_name_or_path: str,
+    device: str,
+    dtype: torch.dtype,
+):
+    local_repo_dir = snapshot_download(
+        repo_id=model_name_or_path,
+        allow_patterns=[
+            "vae/*",
+            "tokenizer/*",
+            "text_encoder/*",
+        ],
+    )
 
-    vae = AutoencoderKL.from_pretrained(vae_source)
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_source)
-    text_encoder = AutoModel.from_pretrained(text_encoder_source)
+    vae = AutoencoderKLQwenImage.from_pretrained(local_repo_dir, subfolder="vae")
+    tokenizer = AutoTokenizer.from_pretrained(local_repo_dir, subfolder="tokenizer")
+    text_encoder = AutoModel.from_pretrained(local_repo_dir, subfolder="text_encoder")
 
     vae = vae.to(device=device, dtype=dtype)
     text_encoder = text_encoder.to(device=device, dtype=dtype)
@@ -125,17 +125,23 @@ def preprocess_collate_fn(items, preprocessor: QwenImagePreProcessor):
     return processed_batch
 
 def main() -> None:
-    args = parse_args()
+    cli_args = parse_args()
     init_dist()
+
     try:
-        args = args_to_training_engine(args)
+        args = args_to_training_engine(cli_args)
         set_seed(args.seed)
+
         local_rank = int(os.environ.get("LOCAL_RANK", "0"))
         if torch.cuda.is_available():
             torch.cuda.set_device(local_rank)
 
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        dtype = torch.bfloat16 if cli_args.mixed_precision == "bf16" and torch.cuda.is_available() else torch.float32
+        if torch.cuda.is_available():
+            device = "cuda"
+            dtype = torch.bfloat16 if cli_args.mixed_precision == "bf16" else torch.float32
+        else:
+            device = "cpu"
+            dtype = torch.float32
 
         dataset = ImageCaptionDataset(
             root=cli_args.train_data_dir,
@@ -150,9 +156,6 @@ def main() -> None:
 
         vae, tokenizer, text_encoder = build_upstream_modules(
             model_name_or_path=cli_args.model_name_or_path,
-            vae_name_or_path=cli_args.vae_name_or_path,
-            tokenizer_name_or_path=cli_args.tokenizer_name_or_path,
-            text_encoder_name_or_path=cli_args.text_encoder_name_or_path,
             device=device,
             dtype=dtype,
         )
@@ -181,6 +184,7 @@ def main() -> None:
             model_name_or_path=args.model_name_or_path,
             parallel_config=args.parallel_config(),
         )
+
         trainer = Trainer(
             args=args,
             core=core,
@@ -188,6 +192,7 @@ def main() -> None:
             optimizer_factory=lambda model: build_optimizer(model, args),
         )
         trainer.train()
+
     finally:
         if dist.is_available() and dist.is_initialized():
             dist.destroy_process_group()
