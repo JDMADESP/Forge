@@ -143,6 +143,18 @@ def main() -> None:
             device = "cpu"
             dtype = torch.float32
 
+        local_model_dir = snapshot_download(
+            repo_id=cli_args.model_name_or_path,
+            allow_patterns=[
+                "transformer/*",
+                "vae/*",
+                "tokenizer/*",
+                "text_encoder/*",
+            ],
+        )
+
+        args.model_name_or_path = local_model_dir
+
         dataset = ImageCaptionDataset(
             root=cli_args.train_data_dir,
             image_size=cli_args.image_size,
@@ -155,7 +167,7 @@ def main() -> None:
             sampler = DistributedSampler(dataset, shuffle=False)
 
         vae, tokenizer, text_encoder = build_upstream_modules(
-            model_name_or_path=cli_args.model_name_or_path,
+            model_name_or_path=local_model_dir,
             device=device,
             dtype=dtype,
         )
