@@ -141,6 +141,7 @@ def main() -> None:
                 "vae/*",
                 "tokenizer/*",
                 "text_encoder/*",
+                "scheduler/*",
             ],
         )
 

@@ -37,7 +37,14 @@ class QwenImageRuntime(ModelRuntime):
             self.model_name_or_path,
             subfolder="scheduler",
         )
-        scheduler.set_timesteps(scheduler.config.num_train_timesteps)
+
+        num_steps = scheduler.config.num_train_timesteps
+
+        if getattr(scheduler.config, "use_dynamic_shifting", True):
+            scheduler.set_timesteps(num_steps, mu=1.0)
+        else:
+            scheduler.set_timesteps(num_steps)
+
         self.runtime_modules = {
             "dit": model,
             "noise_scheduler": scheduler,
@@ -87,14 +94,65 @@ class QwenImageRuntime(ModelRuntime):
             model_extras=model_extras,
         )
 
+    def _patchify_latents(self, latents: torch.Tensor, patch_size: int = 2) -> torch.Tensor:
+        """
+        Convert [B, C, H, W] latents into [B, N, C * patch_size * patch_size],
+        where N = (H / patch_size) * (W / patch_size).
+        """
+        if latents.ndim != 4:
+            raise ValueError(f"Expected 4D latents [B, C, H, W], got {latents.shape}")
+
+        b, c, h, w = latents.shape
+        if h % patch_size != 0 or w % patch_size != 0:
+            raise ValueError(
+                f"Latent spatial dims must be divisible by patch_size={patch_size}, got H={h}, W={w}"
+            )
+
+        latents = latents.reshape(
+            b,
+            c,
+            h // patch_size,
+            patch_size,
+            w // patch_size,
+            patch_size,
+        )
+        latents = latents.permute(0, 2, 4, 1, 3, 5).contiguous()
+        latents = latents.reshape(
+            b,
+            (h // patch_size) * (w // patch_size),
+            c * patch_size * patch_size,
+        )
+        return latents
+
+
     def prepare_forward_inputs(self, batch: DenoiseBatch, objective_state: dict[str, Any]) -> dict[str, Any]:
         model_extras = batch.model_extras
+
+        noisy_latents = objective_state["noisy_latents"]
+
+        patch_size = 2
+        hidden_states = self._patchify_latents(noisy_latents, patch_size=patch_size)
+
+        # img_shapes should describe the patch grid, not the raw latent grid
+        if noisy_latents.ndim != 4:
+            raise ValueError(f"Expected 4D noisy latents, got {noisy_latents.shape}")
+
+        _, _, latent_h, latent_w = noisy_latents.shape
+        patched_h = latent_h // patch_size
+        patched_w = latent_w // patch_size
+        batch_size = noisy_latents.shape[0]
+
+        # Qwen pos_embed expects: batch -> list of image/video items -> [frame, height, width]
+        # For a single image per sample, that means [[[1, H, W]], ...]
+        img_shapes = [[[1, patched_h, patched_w]] for _ in range(batch_size)]
+
+        print("DEBUG img_shapes passed to model:", img_shapes)
         return {
-            "hidden_states": objective_state["noisy_latents"],
+            "hidden_states": hidden_states,
             "encoder_hidden_states": batch.prompt_embeds,
             "encoder_hidden_states_mask": model_extras["encoder_hidden_states_mask"],
             "timestep": objective_state["timesteps"],
-            "img_shapes": model_extras["img_shapes"],
+            "img_shapes": img_shapes,
             "guidance": model_extras.get("guidance"),
             "attention_kwargs": model_extras.get("attention_kwargs"),
             "return_dict": False,

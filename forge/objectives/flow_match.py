@@ -29,7 +29,8 @@ class FlowMatchObjective(TrainingObjective):
             batch.image_embeds = self._move_value(batch.image_embeds, device=device, dtype=dtype)
         if batch.model_extras:
             batch.model_extras = {
-                key: self._move_value(value, device=device, dtype=dtype) for key, value in batch.model_extras.items()
+                key: self._move_value(value, device=device, dtype=dtype)
+                for key, value in batch.model_extras.items()
             }
 
         noise = batch.noise
@@ -74,12 +75,51 @@ class FlowMatchObjective(TrainingObjective):
     ) -> tuple[torch.Tensor, dict[str, float], dict[str, Any]]:
         model_pred = model_outputs[0]
         target = objective_state["target"]
+
+        # Qwen runtime patchifies latents before the transformer, so patchify the
+        # flow-matching target the same way before computing MSE.
+        if model_pred.ndim == 3 and target.ndim == 4:
+            target = self._patchify_latents(target, patch_size=2)
+
+        print("DEBUG model_pred shape:", model_pred.shape)
+        print("DEBUG target shape:", target.shape)
+
         loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
         metrics = {"loss": float(loss.detach().item())}
         artifacts = {"sample_ids": batch.sample_ids}
         return loss, metrics, artifacts
 
-    # might need to refactor here
+    @staticmethod
+    def _patchify_latents(latents: torch.Tensor, patch_size: int = 2) -> torch.Tensor:
+        """
+        Convert [B, C, H, W] -> [B, N, C * patch_size * patch_size]
+        where N = (H / patch_size) * (W / patch_size).
+        """
+        if latents.ndim != 4:
+            raise ValueError(f"Expected 4D latents [B, C, H, W], got {latents.shape}")
+
+        b, c, h, w = latents.shape
+        if h % patch_size != 0 or w % patch_size != 0:
+            raise ValueError(
+                f"Latent spatial dims must be divisible by patch_size={patch_size}, got H={h}, W={w}"
+            )
+
+        latents = latents.reshape(
+            b,
+            c,
+            h // patch_size,
+            patch_size,
+            w // patch_size,
+            patch_size,
+        )
+        latents = latents.permute(0, 2, 4, 1, 3, 5).contiguous()
+        latents = latents.reshape(
+            b,
+            (h // patch_size) * (w // patch_size),
+            c * patch_size * patch_size,
+        )
+        return latents
+
     @staticmethod
     def _resolve_timesteps(
         timesteps: torch.Tensor,
@@ -119,7 +159,10 @@ class FlowMatchObjective(TrainingObjective):
                 return value.to(device=device, dtype=dtype)
             return value.to(device=device)
         if isinstance(value, dict):
-            return {key: FlowMatchObjective._move_value(item, device=device, dtype=dtype) for key, item in value.items()}
+            return {
+                key: FlowMatchObjective._move_value(item, device=device, dtype=dtype)
+                for key, item in value.items()
+            }
         if isinstance(value, list):
             return [FlowMatchObjective._move_value(item, device=device, dtype=dtype) for item in value]
         if isinstance(value, tuple):
