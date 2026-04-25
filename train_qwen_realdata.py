@@ -97,22 +97,13 @@ def set_seed(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 def build_upstream_modules(
-    model_name_or_path: str,
+    local_model_dir: str,
     device: str,
     dtype: torch.dtype,
 ):
-    local_repo_dir = snapshot_download(
-        repo_id=model_name_or_path,
-        allow_patterns=[
-            "vae/*",
-            "tokenizer/*",
-            "text_encoder/*",
-        ],
-    )
-
-    vae = AutoencoderKLQwenImage.from_pretrained(local_repo_dir, subfolder="vae")
-    tokenizer = AutoTokenizer.from_pretrained(local_repo_dir, subfolder="tokenizer")
-    text_encoder = AutoModel.from_pretrained(local_repo_dir, subfolder="text_encoder")
+    vae = AutoencoderKLQwenImage.from_pretrained(local_model_dir, subfolder="vae")
+    tokenizer = AutoTokenizer.from_pretrained(local_model_dir, subfolder="tokenizer")
+    text_encoder = AutoModel.from_pretrained(local_model_dir, subfolder="text_encoder")
 
     vae = vae.to(device=device, dtype=dtype)
     text_encoder = text_encoder.to(device=device, dtype=dtype)
@@ -167,7 +158,7 @@ def main() -> None:
             sampler = DistributedSampler(dataset, shuffle=False)
 
         vae, tokenizer, text_encoder = build_upstream_modules(
-            model_name_or_path=local_model_dir,
+            local_model_dir=local_model_dir,
             device=device,
             dtype=dtype,
         )
